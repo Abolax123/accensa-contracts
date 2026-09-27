@@ -160,7 +160,7 @@ fn buyback_reverts_when_slippage_floor_is_not_met() {
     // 1,000 in -> 1,000 out, below the 1,500 floor.
     assert_eq!(
         ctx.client.try_execute_buyback(&1_000, &1_500),
-        Err(Ok(Error::SlippageExceeded))
+        Err(Ok(Error::BuybackSlippageExceeded))
     );
     // The whole invocation reverted: no fees spent, nothing burned.
     assert_eq!(ctx.balance(&ctx.fee_token, &ctx.treasury), FEE_SUPPLY);

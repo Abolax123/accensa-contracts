@@ -18,7 +18,7 @@
 //! The DEX is untrusted. `execute` passes the caller's `min_amount_out`
 //! straight to the router *and* re-checks the returned amount against it, so a
 //! router that under-fills reverts the whole invocation
-//! ([`Error::SlippageExceeded`]) rather than letting the treasury overpay.
+//! ([`Error::BuybackSlippageExceeded`]) rather than letting the treasury overpay.
 //! Because the burn address is fixed at configuration time it cannot be
 //! redirected by the keeper either.
 
@@ -144,7 +144,7 @@ pub(crate) fn execute(env: &Env, amount_in: i128, min_amount_out: i128) -> Resul
         return Err(Error::BelowBuybackThreshold);
     }
     if min_amount_out <= 0 {
-        return Err(Error::SlippageExceeded);
+        return Err(Error::BuybackSlippageExceeded);
     }
 
     let contract = env.current_contract_address();
@@ -165,7 +165,7 @@ pub(crate) fn execute(env: &Env, amount_in: i128, min_amount_out: i128) -> Resul
 
     // Re-check the untrusted router's result against the slippage floor.
     if amount_out < min_amount_out {
-        return Err(Error::SlippageExceeded);
+        return Err(Error::BuybackSlippageExceeded);
     }
 
     token::Client::new(env, &config.governance_token).transfer(

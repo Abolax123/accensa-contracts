@@ -147,16 +147,6 @@ pub enum Error {
     NothingToDeploy = 18,
     /// The liquid reserve was set above 100% (issue #466).
     InvalidReserve = 19,
-    /// A buyback ran before the admin configured it (`execute_buyback`, #465).
-    BuybackNotConfigured = 20,
-    /// The requested buyback is smaller than the configured minimum.
-    BelowBuybackThreshold = 21,
-    /// The DEX returned less than the caller's slippage floor.
-    SlippageExceeded = 22,
-    /// The buyback configuration parameters were invalid.
-    InvalidBuybackConfig = 23,
-    /// The treasury does not hold enough of the fee token to run the buyback.
-    InsufficientBuybackFloat = 24,
     /// Fee liquidation was requested before an AMM, stablecoin, or price feed
     /// was configured (issue #444).
     LiquidationNotConfigured = 20,
@@ -173,6 +163,16 @@ pub enum Error {
     /// The price feed returned a non-positive or unusable price
     /// (issue #444).
     InvalidPrice = 24,
+    /// A buyback ran before the admin configured it (`execute_buyback`, #465).
+    BuybackNotConfigured = 25,
+    /// The requested buyback is smaller than the configured minimum.
+    BelowBuybackThreshold = 26,
+    /// The DEX returned less than the caller's slippage floor.
+    BuybackSlippageExceeded = 27,
+    /// The buyback configuration parameters were invalid.
+    InvalidBuybackConfig = 28,
+    /// The treasury does not hold enough of the fee token to run the buyback.
+    InsufficientBuybackFloat = 29,
 }
 
 /// Emitted when the admin registers a beneficiary's allocation.
