@@ -298,6 +298,8 @@ pub struct VaultInit {
 }
 pub mod audit;
 pub mod blacklist;
+pub mod constant_time;
+pub mod events;
 pub mod math;
 pub mod nonce;
 pub mod storage;

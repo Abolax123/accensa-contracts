@@ -9,6 +9,55 @@ breaking changes bump the **minor** version, and they are called out as such.
 ## [Unreleased]
 
 ### Added
+- **`common` (issue #436): constant-time cryptographic comparison.** New
+  `constant_time_eq(a, b)` helper (`contracts/common/src/constant_time.rs`)
+  compares byte slices without short-circuiting: every byte and the length
+  difference are folded into one OR accumulator that is inspected exactly once
+  at the end, and `core::hint::black_box` stops the optimizer re-introducing the
+  early exit. Intended for MAC/token/digest equality where a shared-prefix
+  timing leak matters.
+- **`multisig-account` (issue #434): weight-based threshold voting.** Signers
+  now carry a `u32` weight (default `1`), and `__check_auth` admits a call when
+  the aggregate weight of the attached approvers reaches the threshold rather
+  than the raw signer count. Governance (the account's own threshold
+  authorization) updates a signer with `set_signer_weight`, adds/removes
+  weighted signers with `add_signer` / `remove_signer`, and every mutation
+  enforces the invariant `total_signers_weight >= threshold`.
+  `rotate_signers_and_threshold` keeps the weighted bookkeeping consistent and
+  refuses a rotation that would break that invariant.
+- **`upto-authorization` (issue #435): inactivity auto-cancellation.** New
+  `cancel_inactive_escrow(payment_id)` lets the buyer unilaterally release an
+  authorization that has gone unclaimed for the governance-set inactivity
+  window (`set_inactivity_timeout`, default ~30 days), zeroing the outstanding
+  allowance and deleting the record to reclaim its rent. Only the buyer's
+  authorization is required — never the facilitator's. Emits
+  `EscrowCancelledInactivity`.
+- **`treasury` (issue #444): automated AMM fee liquidation.** New `liquidation`
+  module (`contracts/treasury/src/liquidation.rs`) with abstracted `Amm` and
+  `PriceFeed` clients. Governance whitelists an AMM (`whitelist_amm`), sets the
+  primary stablecoin (`set_stable_token`) and price feed (`set_price_feed`);
+  `liquidate_fees(token_in, amount_in, max_slippage_bps)` derives a minimum
+  output from the oracle price, swaps through the AMM, and rejects any delivery
+  below that floor or below what the AMM reported.
+- **`common` (issue #463): standardized event emission for indexer subgraphs.**
+  Defines canonical `[Protocol, Module, Action]` topic schema (`PROTOCOL = symbol_short!("accensa")`)
+  and typed event payloads (`TransferEventPayload`, `RefundEventPayload`, `ChannelStatePayload`,
+  `AnchorEventPayload`) for granular GraphQL indexing.
+- **`state-channel` (issue #461): ephemeral key delegation for mobile wallets.**
+  Adds `DelegationCertificate` allowing temporary Ed25519 signing keys to act on
+  behalf of master keys within a ledger sequence window. Supports both
+  channel-scoped and wildcard delegations, verified on-chain in
+  `update_state_delegated` and `close_channel_delegated`.
+- **`cross-chain` (issue #457): Wormhole VAA parsing and guardian verification.**
+  Parses Wormhole VAA binary envelopes and verifies guardian secp256k1 signatures
+  over double-keccak256 body digests via `env.crypto().secp256k1_recover`. Enforces
+  strictly ascending guardian index ordering and quorum requirements (`(2N/3) + 1`)
+  against stored active `GuardianSet` records.
+- **`cross-chain` (issue #456): outbound withdrawal bridging requests.** Implements
+  `withdraw_to_evm` on `CrossChainBridge`, burning wrapped tokens on Soroban,
+  incrementing a monotonic sequence number, and emitting standardized
+  `OutboundBridgePayload` events under `(bridge, withdraw, sequence)` for
+  relayer consumption. Includes admin-controlled pause/unpause toggles.
 - **`refund-vault-factory` (issue #464): protocol TVL query.** New read-only
   `get_tvl(asset)` sums the `asset` balance of every vault the factory has
   deployed — read from the SEP-41 token contract rather than the vault's own
@@ -25,6 +74,19 @@ breaking changes bump the **minor** version, and they are called out as such.
   `vested_amount` / `claimable` preview the curve without changing state. A
   schedule can never pay out more than its `total`, and a claim with nothing
   new unlocked fails with `Error::NothingToClaim`.
+- **`treasury` (issue #466): diversified stablecoin yield strategies.** New
+  `strategies` module (`contracts/treasury/src/strategies.rs`) splitting idle
+  reserves across several whitelisted yield protocols. Governance approves
+  addresses with `whitelist_strategy` and sets percentages with
+  `set_allocations` (weights in basis points, summing to exactly `10_000`);
+  `rebalance_portfolio` then recalls every strategy and redeploys the balance
+  minus the liquid reserve (`set_reserve_bps`, 100% liquid by default), and
+  `recall_strategy` brings a single position — and the yield riding on it —
+  home early. A `Strategy` trait (`deposit` / `withdraw` / `total_balance` /
+  `accrued_yield`, mirroring `refund-vault`'s yield hook) is the adapter
+  interface. Strategies stay untrusted: returns are checked against the
+  treasury's own token balance delta (`Error::StrategyUnderpaid`) and every
+  strategy call runs under a reentrancy lock (`Error::ReentrancyBlocked`).
 - **`state-channel` (issue #471): batched Ed25519 verification.** New `crypto`
   module (`crypto::verify_signatures`) verifies a flat array of
   signer/signature pairs against one canonical payload in a single pass, and
@@ -164,6 +226,19 @@ breaking changes bump the **minor** version, and they are called out as such.
   for more than 90 days of ledgers. The swept `RefundV2` record is deleted to
   reclaim storage, and a `DustSweptEvent` is emitted. Treasury falls back to
   the fee recipient when unset.
+- **`stream-vault` (issue #410): streaming micro-disbursement schedules.**
+  New standalone contract, constructed with `(merchant, token)`.
+  `create_stream(buyer, start_ledger, stop_ledger, rate_per_ledger,
+  deposit)` escrows a buyer's deposit and streams it linearly to the
+  merchant; the claimable balance is `min(deposit, (ledger - start) * rate)`
+  less prior claims. `claim_stream` is permissionless and closes the stream
+  once the stop ledger is reached. The buyer can `pause_stream` /
+  `resume_stream` (resuming shifts the schedule by the paused duration) or
+  `cancel_stream`, which pays the merchant what has streamed and returns
+  unspent principal. Adds `get_stream` and `get_stream_claimable`. It is a
+  separate contract because `RefundVault` has no room left under the
+  128 KiB contract size limit, and it keeps buyer escrow apart from the
+  refund float.
 - **`multisig-account` (issue #425): Ed25519 signature malleability protection.**
   New `crypto` module rejects any signature whose `s` scalar is not strictly
   below the group order `L` (e.g. the malleated twin `(R, s + L)`) with
