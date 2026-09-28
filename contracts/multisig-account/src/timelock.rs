@@ -4,6 +4,8 @@ use soroban_sdk::{contracttype, Address, BytesN, Env};
 use crate::DataKey;
 use crate::Error;
 
+
+
 /// Timelock delay queue for sensitive admin actions in the multisig account.
 ///
 /// High-risk operations (signer set updates, threshold decreases, code
@@ -43,9 +45,7 @@ pub fn queue_transaction(
     required_approvals: u32,
     guardian: Address,
 ) -> u64 {
-    let current_ledger = env.ledger().sequence();
-    let execution_ledger = current_ledger + execution_delay;
-
+    let execution_ledger = env.ledger().sequence() + execution_delay;
     let queue_id = env
         .storage()
         .instance()
@@ -115,11 +115,9 @@ pub fn cancel_queued_transaction(env: &Env, queue_id: u64, caller: &Address) -> 
     }
 
     // Only the guardian can cancel during the delay window
-    let stored_guardian: Address = env
-        .storage()
-        .persistent()
-        .get(&DataKey::TimelockGuardian)
-        .ok_or(Error::Unauthorized)?;
+    // (Signers could also cancel, but for simplicity here we assume guardian only
+    // or expand logic if signers are needed).
+    let stored_guardian = tuple.4;
 
     if *caller != stored_guardian {
         return Err(Error::Unauthorized);
@@ -141,14 +139,15 @@ pub fn approve_queued_transaction(env: &Env, queue_id: u64, signer: &Address) ->
         .get(&key)
         .ok_or(Error::ProposalNotFound)?;
 
+    // Check if signer already approved
     let approval_key = DataKey::TimelockApproval(queue_id, signer.clone());
     if env.storage().temporary().has(&approval_key) {
         return Err(Error::AlreadyVoted);
     }
 
     env.storage().temporary().set(&approval_key, &());
-    let new_approval_count = tuple.2.saturating_add(1);
-    let new_tuple = (tuple.0, tuple.1, new_approval_count, tuple.3, tuple.4);
+
+    let new_tuple = (tuple.0, tuple.1, tuple.2 + 1, tuple.3, tuple.4);
     env.storage().persistent().set(&key, &new_tuple);
 
     Ok(())
@@ -177,92 +176,86 @@ pub fn get_queued_transaction(env: &Env, queue_id: u64) -> Result<QueuedTransact
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Ledger, Env};
+    use soroban_sdk::{testutils::{Ledger, Address as _}, Env};
 
     #[test]
     fn test_queue_and_execute() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let guardian = Address::from_str(&env, "X:GDQ");
-        let call_hash = [1u8; 32];
-
-        let queue_id = queue_transaction(&env, call_hash, 10, 1, guardian.clone());
-        let queued = get_queued_transaction(&env, queue_id).unwrap();
-
-        assert_eq!(queued.call_hash, BytesN::from_array(&env, &call_hash));
-        assert_eq!(queued.required_approvals, 1);
-        assert_eq!(queued.execution_ledger, env.ledger().sequence() + 10);
+        let cid = env.register(crate::MultisigAccount, (soroban_sdk::Vec::<soroban_sdk::Address>::new(&env), 1u32));
+        env.as_contract(&cid, || {
+            let guardian = Address::generate(&env);
+            let call_hash = [1u8; 32];
+            let queue_id = queue_transaction(&env, call_hash, 10, 1, guardian.clone());
+            let queued = get_queued_transaction(&env, queue_id).unwrap();
+            assert_eq!(queued.call_hash, BytesN::from_array(&env, &call_hash));
+            assert_eq!(queued.required_approvals, 1);
+            assert_eq!(queued.execution_ledger, env.ledger().sequence() + 10);
+        });
     }
 
     #[test]
     fn test_execute_before_timelock_fails() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let guardian = Address::from_str(&env, "X:GDQ");
-        let call_hash = [1u8; 32];
-
-        let queue_id = queue_transaction(&env, call_hash, DEFAULT_TIMELOCK_DELAY, 1, guardian);
-
-        let result = execute_queued_transaction(&env, queue_id);
-        assert!(result.is_err(), "execution before timelock should fail");
+        let cid = env.register(crate::MultisigAccount, (soroban_sdk::Vec::<soroban_sdk::Address>::new(&env), 1u32));
+        env.as_contract(&cid, || {
+            let guardian = Address::generate(&env);
+            let call_hash = [1u8; 32];
+            let queue_id = queue_transaction(&env, call_hash, DEFAULT_TIMELOCK_DELAY, 1, guardian);
+            let result = execute_queued_transaction(&env, queue_id);
+            assert!(result.is_err(), "execution before timelock should fail");
+        });
     }
 
     #[test]
     fn test_cancel_during_delay() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let guardian = Address::from_str(&env, "X:GDQ");
-        let call_hash = [1u8; 32];
-
-        let queue_id =
-            queue_transaction(&env, call_hash, DEFAULT_TIMELOCK_DELAY, 1, guardian.clone());
-
-        let result = cancel_queued_transaction(&env, queue_id, &guardian);
-        assert!(result.is_ok(), "guardian should cancel during delay");
-
-        let result = get_queued_transaction(&env, queue_id);
-        assert!(result.is_err(), "cancelled transaction should not exist");
+        let cid = env.register(crate::MultisigAccount, (soroban_sdk::Vec::<soroban_sdk::Address>::new(&env), 1u32));
+        env.as_contract(&cid, || {
+            let guardian = Address::generate(&env);
+            let call_hash = [1u8; 32];
+            let queue_id = queue_transaction(&env, call_hash, DEFAULT_TIMELOCK_DELAY, 1, guardian.clone());
+            let result = cancel_queued_transaction(&env, queue_id, &guardian);
+            assert!(result.is_ok(), "guardian should cancel during delay");
+            let result = get_queued_transaction(&env, queue_id);
+            assert!(result.is_err(), "cancelled transaction should not exist");
+        });
     }
 
     #[test]
     fn test_cancel_after_timelock_fails() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let guardian = Address::from_str(&env, "X:GDQ");
-        let call_hash = [1u8; 32];
-
-        let queue_id = queue_transaction(&env, call_hash, 0, 1, guardian.clone());
-
-        env.ledger()
-            .with_mut(|l| l.sequence_number += DEFAULT_TIMELOCK_DELAY + 1);
-
-        let result = cancel_queued_transaction(&env, queue_id, &guardian);
-        assert!(result.is_err(), "cancel after timelock should fail");
+        let cid = env.register(crate::MultisigAccount, (soroban_sdk::Vec::<soroban_sdk::Address>::new(&env), 1u32));
+        env.as_contract(&cid, || {
+            let guardian = Address::generate(&env);
+            let call_hash = [1u8; 32];
+            let queue_id = queue_transaction(&env, call_hash, 0, 1, guardian.clone());
+            env.ledger().with_mut(|l| l.sequence_number += DEFAULT_TIMELOCK_DELAY + 1);
+            let result = cancel_queued_transaction(&env, queue_id, &guardian);
+            assert!(result.is_err(), "cancel after timelock should fail");
+        });
     }
 
     #[test]
     fn test_approve_and_execute() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let guardian = Address::from_str(&env, "X:GDQ");
-        let call_hash = [1u8; 32];
-        let signer = Address::from_str(&env, "X:SIGNER");
-
-        let queue_id = queue_transaction(&env, call_hash, 10, 1, guardian);
-        approve_queued_transaction(&env, queue_id, &signer).unwrap();
-
-        env.ledger().with_mut(|l| l.sequence_number += 11);
-        let result = execute_queued_transaction(&env, queue_id);
-        assert!(
-            result.is_ok(),
-            "execution after timelock with approvals should succeed"
-        );
+        let cid = env.register(crate::MultisigAccount, (soroban_sdk::Vec::<soroban_sdk::Address>::new(&env), 1u32));
+        env.as_contract(&cid, || {
+            let guardian = Address::generate(&env);
+            let call_hash = [1u8; 32];
+            let signer = Address::generate(&env);
+            let queue_id = queue_transaction(&env, call_hash, 10, 1, guardian);
+            approve_queued_transaction(&env, queue_id, &signer).unwrap();
+            env.ledger().with_mut(|l| l.sequence_number += 11);
+            let result = execute_queued_transaction(&env, queue_id);
+            assert!(result.is_ok(), "execution after timelock with approvals should succeed");
+        });
     }
 }
