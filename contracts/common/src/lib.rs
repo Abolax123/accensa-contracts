@@ -157,6 +157,25 @@ pub enum Error {
     InsufficientChannelBalance = 407,
     /// The timeout has already passed; the channel is expired.
     ChannelExpired = 408,
+    /// A multi-asset state names a token the channel does not escrow, or
+    /// omits one it does (issue #423).
+    UnsupportedAsset = 409,
+    /// The referenced HTLC does not exist on the channel (issue #458).
+    HtlcNotFound = 410,
+    /// The HTLC is no longer pending (already resolved or refunded).
+    HtlcNotPending = 411,
+    /// The HTLC's timeout ledger has not yet passed, so it cannot be refunded.
+    HtlcNotExpired = 412,
+    /// The supplied preimage does not hash to the HTLC's hash lock.
+    InvalidPreimage = 413,
+    /// A downstream HTLC's timeout must be strictly smaller than its
+    /// upstream parent's (issue #458).
+    HtlcTimeoutOutOfOrder = 414,
+    /// The HTLC would reserve more than the channel's uncommitted escrow.
+    HtlcInsufficientEscrow = 415,
+    /// The HTLC's timeout ledger is already in the past, so it could never be
+    /// resolved before a refund (issue #458).
+    HtlcTimeoutElapsed = 416,
     /// A policy that requires the stateless policy contracts (time/VDF) was
     /// proposed or executed on a vault that was never wired with the contract
     /// addresses (issue #129: the factory wires them at construction, or the
@@ -173,6 +192,12 @@ pub enum Error {
     /// (issue #396). The operation was refused *before* any state changed;
     /// raw operators never run in the shared math helpers.
     MathOverflow = 321,
+    /// The yield strategy is not on the vault's admin-approved whitelist
+    /// (issue #415).
+    StrategyNotApproved = 322,
+    /// The active yield strategy still holds deployed principal, so it cannot
+    /// be replaced or revoked until that principal is recalled (issue #415).
+    StrategyHasPrincipal = 323,
     /// Explicit Soroban Host error mapping (issue #380).
     HostError = 500,
 }
@@ -276,6 +301,9 @@ pub struct VaultInit {
 }
 pub mod audit;
 pub mod blacklist;
+pub mod constant_time;
+pub mod events;
 pub mod math;
 pub mod nonce;
 pub mod reentrancy;
+pub mod storage;

@@ -1,11 +1,12 @@
 #![no_std]
 
 pub mod events;
+pub mod incremental_merkle;
+pub mod merkle;
 pub mod signatures;
 pub mod zk_verifier;
 
 use accensa_common::Error;
-use sha2::{Digest, Sha256};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contractmeta, contracttype, Address,
     BytesN, Env, InvokeError, Vec,
@@ -61,6 +62,9 @@ pub enum DataKey {
     Shard(u64, u64),
     /// Proposed admin address pending acceptance via `accept_admin` (issue #288).
     PendingAdmin,
+    /// Append-only incremental Merkle tree state (issue #424): leaf count,
+    /// current root and packed frontier. See [`incremental_merkle`].
+    IncrementalTree,
 }
 
 /// Admin-configurable token-bucket rate limit applied to `anchor_batch`.
@@ -232,6 +236,19 @@ pub struct AnchorIntervalUpdatedEvent {
     pub previous_interval: u32,
     pub new_interval: u32,
     pub ledger: u32,
+}
+
+/// Emitted when a receipt leaf is appended to the incremental Merkle tree.
+///
+/// Topics: `("receipt_leaf_inserted_event", leaf_index)`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptLeafInsertedEvent {
+    #[topic]
+    pub leaf_index: u64,
+    pub leaf: BytesN<32>,
+    /// Tree root after the insertion.
+    pub root: BytesN<32>,
 }
 
 /// Approximately 30 days of ledgers, assuming ~5 seconds per ledger.
@@ -530,6 +547,27 @@ impl ReceiptAnchor {
         )
     }
 
+    /// Verify that `leaf` (the SHA-256 hash of an off-chain receipt) belongs
+    /// to the batch committed as `root` in `shard_id`.
+    ///
+    /// `proof` is the sorted-pair sibling path from leaf to root (ADR-001),
+    /// at most [`MAX_PROOF_LEN`] hashes. Sorted-pair hashing carries no
+    /// left/right position, so no leaf index is needed or accepted.
+    ///
+    /// Returns `Ok(true)` for a valid proof and `Ok(false)` for an invalid
+    /// one. Fails with [`Error::RootNotFound`] if `root` is not among the
+    /// shard's retained roots, and [`Error::ProofTooLong`] for oversize
+    /// proofs.
+    pub fn verify_receipt_leaf(
+        env: Env,
+        shard_id: u64,
+        root: BytesN<32>,
+        leaf: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        Self::verify_receipt_by_root(env, shard_id, root, leaf, proof)
+    }
+
     /// Verify a receipt against any root in `shard_id`'s historical ring
     /// buffer. Returns `true` if the root is in the buffer AND the Merkle
     /// proof is valid. Roots are isolated per shard, so a root anchored in one
@@ -564,28 +602,7 @@ impl ReceiptAnchor {
             return Err(Error::RootNotFound);
         }
 
-        let computed_hash = Self::fold_proof(leaf.to_array(), proof);
-
-        Ok(computed_hash == root.to_array())
-    }
-
-    /// Folds a sorted-pair Merkle proof with one allocation-free guest loop.
-    fn fold_proof(mut computed_hash: [u8; 32], proof: Vec<BytesN<32>>) -> [u8; 32] {
-        for sibling_bytes in proof.into_iter() {
-            let sibling = sibling_bytes.to_array();
-            let mut combined = [0u8; 64];
-            if computed_hash <= sibling {
-                combined[..32].copy_from_slice(&computed_hash);
-                combined[32..].copy_from_slice(&sibling);
-            } else {
-                combined[..32].copy_from_slice(&sibling);
-                combined[32..].copy_from_slice(&computed_hash);
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(combined);
-            computed_hash = hasher.finalize().into();
-        }
-        computed_hash
+        Ok(merkle::verify(&root, &leaf, &proof))
     }
 
     /// Returns the current ring buffer of historical roots for `shard_id`
@@ -737,6 +754,68 @@ impl ReceiptAnchor {
             .instance()
             .get(&DataKey::MinAnchorInterval)
             .unwrap_or(0)
+    }
+
+    /// Append `leaf_hash` to the continuous-anchoring incremental Merkle tree
+    /// (issue #424) and return its zero-based leaf index. Admin only.
+    ///
+    /// Costs at most [`incremental_merkle::MAX_DEPTH`] hashes and a single
+    /// instance-storage write; the resulting root equals the batch root of
+    /// every leaf inserted so far, so batch-style proofs verify against it.
+    ///
+    /// # Errors
+    /// - `NotInitialized`: the contract has no admin.
+    /// - `BatchTooLarge`: the tree already holds
+    ///   [`incremental_merkle::MAX_LEAVES`] leaves.
+    pub fn insert_receipt_leaf(env: Env, leaf_hash: BytesN<32>) -> Result<u64, Error> {
+        let merchant: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        merchant.require_auth();
+
+        let mut tree = env
+            .storage()
+            .instance()
+            .get(&DataKey::IncrementalTree)
+            .unwrap_or_else(|| incremental_merkle::empty(&env));
+        let leaf_index = incremental_merkle::insert(&mut tree, &env, &leaf_hash)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::IncrementalTree, &tree);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+
+        ReceiptLeafInsertedEvent {
+            leaf_index,
+            leaf: leaf_hash,
+            root: tree.root,
+        }
+        .publish(&env);
+
+        Ok(leaf_index)
+    }
+
+    /// Current root of the incremental Merkle tree (read-only).
+    ///
+    /// # Errors
+    /// - `RootNotFound`: no leaf has been inserted yet.
+    pub fn get_incremental_root(env: Env) -> Result<BytesN<32>, Error> {
+        env.storage()
+            .instance()
+            .get::<_, incremental_merkle::IncrementalTree>(&DataKey::IncrementalTree)
+            .map(|tree| tree.root)
+            .ok_or(Error::RootNotFound)
+    }
+
+    /// Number of leaves in the incremental Merkle tree (read-only).
+    pub fn get_incremental_leaf_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get::<_, incremental_merkle::IncrementalTree>(&DataKey::IncrementalTree)
+            .map_or(0, |tree| tree.count)
     }
 
     pub fn get_shard_capacity(_env: Env) -> u64 {

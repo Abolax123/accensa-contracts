@@ -1,11 +1,12 @@
 #![no_std]
 
 use accensa_common::{
-    Error, PolicyContext, RefundPolicyClient, TimePolicyParams, VaultInit, VdfPolicyParams,
+    storage::extend_instance_ttl, Error, PolicyContext, RefundPolicyClient, TimePolicyParams,
+    VaultInit, VdfPolicyParams,
 };
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, contractmeta, contracttype, token,
-    xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec,
+    contract, contractevent, contractimpl, contractmeta, contracttype, token, xdr::ToXdr, Address,
+    Bytes, BytesN, Env, Symbol, Vec,
 };
 
 contractmeta!(key = "name", val = "RefundVault");
@@ -138,6 +139,20 @@ pub enum DataKey {
     /// Global last claim wall-clock timestamp (Unix seconds). Used when a
     /// global cooldown is configured.
     LastClaim,
+    /// Residual refund balance strictly below which a closed escrow's
+    /// remainder counts as dust (issue #427). Defaults to
+    /// [`dust::DEFAULT_DUST_THRESHOLD`].
+    DustThreshold,
+    /// Treasury receiving swept dust (issue #427). Falls back to the fee
+    /// recipient when unset.
+    DustTreasury,
+    /// Whitelist flag for a yield strategy (issue #415). Only approved
+    /// strategies can be registered or receive deployments. Persistent.
+    ApprovedStrategy(Address),
+    /// Destination of harvested yield — the protocol treasury or a merchant
+    /// rebate pool (issue #415). Falls back to the merchant when unset.
+    /// Persistent.
+    YieldRecipient,
 }
 
 #[contracttype]
@@ -445,36 +460,12 @@ pub struct CommitRevealedEvent {
     pub ledger: u32,
 }
 
+pub mod dust;
 pub mod oracle;
+pub mod settlement;
 
-/// Interface for external yield-generating strategies (e.g., Soroban lending protocols).
-///
-/// Any contract that implements these methods can be registered as the vault's yield
-/// strategy. The vault calls these to deploy idle funds and harvest accrued yield.
-/// The trait is annotated `#[contractclient(name = "YieldStrategyClient")]` (not
-/// `#[contractimpl]`, which only accepts `impl` blocks) so its client is
-/// generated from the interface.
-#[contractclient(name = "YieldStrategyClient")]
-pub trait YieldStrategy {
-    /// Deploy `amount` tokens into the strategy. The vault transfers tokens to the
-    /// strategy contract before calling this.
-    fn deposit(env: Env, amount: i128) -> Result<(), Error>;
-
-    /// Withdraw `principal` worth of tokens plus any proportional accrued yield.
-    /// Returns `(principal_returned, yield_returned)`. The strategy transfers tokens
-    /// back to the vault before returning.
-    fn withdraw(env: Env, principal: i128) -> Result<(i128, i128), Error>;
-
-    /// Harvest all accrued yield without touching deployed principal.
-    /// Returns the yield amount. The strategy transfers yield tokens to the vault.
-    fn harvest(env: Env) -> Result<i128, Error>;
-
-    /// Read-only: total tokens held by this strategy (principal + accrued yield).
-    fn total_balance(env: Env) -> i128;
-
-    /// Read-only: accrued yield only (total_balance - total principal deployed).
-    fn accrued_yield(env: Env) -> i128;
-}
+pub mod strategy;
+pub use strategy::{YieldStrategy, YieldStrategyClient};
 
 /// Approximately 30 days of ledgers, assuming ~5 seconds per ledger.
 /// 60 * 60 * 24 * 30 / 5 = 518,400.
@@ -846,27 +837,17 @@ fn claim_single(env: &Env, cache: &PolicyCache, claim: &RefundClaim) -> Result<(
     }
 
     // Ceiling check: cumulative refunds must not exceed the original amount.
-    // The ceiling is read from the (re)stored record, freshly minted on the
-    // first partial for this payment.
-    let existing: Option<RefundRecord> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::RefundV2(claim.payment_ref.clone()));
-    let (previous_refunded, record_ceiling) = match existing {
-        Some(rec) => (rec.amount_refunded, rec.payment_amount),
-        None => (0i128, claim.payment_amount),
-    };
-
-    if previous_refunded.checked_add(claim.amount).is_none()
-        || record_ceiling <= 0
-        || previous_refunded + claim.amount > record_ceiling
-    {
-        return Err(Error::ExceedsPayment);
-    }
+    // The rule lives in `settlement::resolve_ceiling` so the live refund path
+    // and `preview_settlement` cannot disagree about it.
+    let (previous_refunded, record_ceiling) =
+        settlement::resolve_ceiling(env, &claim.payment_ref, claim.amount, claim.payment_amount)?;
 
     // Token client: use the cached token address instead of reading from storage.
     let token_client = token::Client::new(env, &cache.token_addr);
     let balance = token_client.balance(&env.current_contract_address());
+    // Deployed principal stays instantly redeemable: recall any shortfall
+    // from the yield strategy before the float check (issue #415).
+    let balance = strategy::ensure_liquidity(env, &token_client, balance, claim.amount)?;
     if balance < claim.amount {
         return Err(Error::InsufficientFloat);
     }
@@ -876,8 +857,7 @@ fn claim_single(env: &Env, cache: &PolicyCache, claim: &RefundClaim) -> Result<(
     // exactly `amount`, so the float check above and the ceiling check against
     // the payment amount are unchanged. The fee rounds *up* (the
     // fractional-token remainder goes to the protocol).
-    let fee = refund_fee(claim.amount, cache.fee_bps);
-    let payout = claim.amount - fee;
+    let (fee, payout) = settlement::split_amount(claim.amount, cache.fee_bps);
 
     let fee_recipient = if fee > 0 {
         let r = active_fee_recipient(env);
@@ -915,9 +895,7 @@ fn claim_single(env: &Env, cache: &PolicyCache, claim: &RefundClaim) -> Result<(
         .persistent()
         .extend_ttl(&DataKey::LastClaim, TTL_THRESHOLD, TTL_EXTEND);
 
-    env.storage()
-        .instance()
-        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+    extend_instance_ttl(env, TTL_THRESHOLD, TTL_EXTEND);
     let extend_to = refund_record_ttl_extend_to(env, window, claim.paid_at_ledger);
     // Threshold == extend_to (not TTL_THRESHOLD): see
     // `refund_record_ttl_extend_to` for why a small fixed threshold makes
@@ -1018,9 +996,7 @@ impl RefundVault {
             .set(&DataKey::DomainSeparator, &separator);
         env.storage().instance().set(&DataKey::Nonce, &0u64);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1095,9 +1071,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         release_reentrancy_lock(&env);
         Ok(())
     }
@@ -1118,9 +1092,7 @@ impl RefundVault {
         }
 
         env.storage().instance().set(&DataKey::Token, &new_token);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1319,9 +1291,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(results)
     }
 
@@ -1359,33 +1329,11 @@ impl RefundVault {
             .ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_address);
 
-        let mut contract_balance = token_client.balance(&env.current_contract_address());
-        if contract_balance < amount {
-            let deployed_principal: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::DeployedPrincipal)
-                .unwrap_or(0);
-            if deployed_principal > 0 {
-                if let Some(strategy_addr) = env
-                    .storage()
-                    .instance()
-                    .get::<_, Address>(&DataKey::YieldStrategy)
-                {
-                    let needed = amount - contract_balance;
-                    let withdraw_amount = core::cmp::min(needed, deployed_principal);
-                    if withdraw_amount > 0 {
-                        let strategy_client = YieldStrategyClient::new(&env, &strategy_addr);
-                        let (_p, _y) = strategy_client.withdraw(&withdraw_amount);
-                        env.storage().instance().set(
-                            &DataKey::DeployedPrincipal,
-                            &(deployed_principal - withdraw_amount),
-                        );
-                        contract_balance = token_client.balance(&env.current_contract_address());
-                    }
-                }
-            }
-        }
+        // Recall deployed principal if the liquid float cannot cover this
+        // withdrawal (issue #415).
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        let contract_balance =
+            strategy::ensure_liquidity(&env, &token_client, contract_balance, amount)?;
 
         if contract_balance < amount {
             return Err(Error::InsufficientFloat);
@@ -1402,9 +1350,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         release_reentrancy_lock(&env);
         Ok(())
     }
@@ -1503,9 +1449,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1535,9 +1479,7 @@ impl RefundVault {
             .instance()
             .set(&DataKey::SettlementContract, &contract);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1554,9 +1496,7 @@ impl RefundVault {
         env.storage()
             .instance()
             .set(&DataKey::ClaimCooldown, &cooldown_secs);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1634,9 +1574,7 @@ impl RefundVault {
             TTL_THRESHOLD,
             TTL_EXTEND,
         );
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         CommitEvent {
             operation,
@@ -1704,9 +1642,7 @@ impl RefundVault {
         env.storage()
             .persistent()
             .remove(&DataKey::Commit(commitment_hash.clone()));
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         CommitRevealedEvent {
             operation,
@@ -1743,9 +1679,7 @@ impl RefundVault {
         oracles.push_back(oracle);
         env.storage().instance().set(&DataKey::Oracles, &oracles);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1789,9 +1723,7 @@ impl RefundVault {
         env.storage()
             .instance()
             .set(&DataKey::StorageVersion, &target_version);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1837,9 +1769,7 @@ impl RefundVault {
         let _ = oracles.remove(index);
         env.storage().instance().set(&DataKey::Oracles, &oracles);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1876,9 +1806,7 @@ impl RefundVault {
                 .instance()
                 .remove(&DataKey::TimePolicyContract),
         }
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -1899,9 +1827,7 @@ impl RefundVault {
                 .set(&DataKey::VdfPolicyContract, &policy),
             None => env.storage().instance().remove(&DataKey::VdfPolicyContract),
         }
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2000,9 +1926,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2028,9 +1952,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2071,9 +1993,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2099,9 +2019,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2120,23 +2038,79 @@ impl RefundVault {
     // with the standard TTL budget after every write.
 
     /// Register an external yield strategy contract. Only callable by admin.
+    ///
+    /// The strategy must first be whitelisted with
+    /// [`RefundVault::approve_yield_strategy`] (`StrategyNotApproved`
+    /// otherwise), and a different strategy cannot replace one that still
+    /// holds deployed principal (`StrategyHasPrincipal`).
     pub fn set_yield_strategy(env: Env, strategy: Address) -> Result<(), Error> {
-        let merchant: Address = env
+        strategy::set_active(&env, strategy)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Add a yield strategy to the admin-approved whitelist (issue #415).
+    pub fn approve_yield_strategy(env: Env, strategy: Address) -> Result<(), Error> {
+        strategy::approve(&env, strategy)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Remove a yield strategy from the whitelist (issue #415). Revoking the
+    /// active strategy also unregisters it and requires its principal to have
+    /// been fully recalled first (`StrategyHasPrincipal`).
+    pub fn revoke_yield_strategy(env: Env, strategy: Address) -> Result<(), Error> {
+        strategy::revoke(&env, strategy)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Read-only: whether `strategy` is on the whitelist.
+    pub fn is_strategy_approved(env: Env, strategy: Address) -> bool {
+        strategy::is_approved(&env, &strategy)
+    }
+
+    /// Set the address that receives harvested yield: the protocol treasury
+    /// or a merchant rebate pool (issue #415). Admin only.
+    pub fn set_yield_recipient(env: Env, recipient: Address) -> Result<(), Error> {
+        strategy::set_recipient(&env, recipient)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Read-only: the yield recipient (the merchant when none is configured).
+    pub fn get_yield_recipient(env: Env) -> Result<Address, Error> {
+        strategy::recipient(&env)
+    }
+
+    /// Pay all harvested yield to the yield recipient (issue #415). Admin
+    /// only. Returns the amount distributed.
+    pub fn distribute_yield(env: Env) -> Result<i128, Error> {
+        acquire_reentrancy_lock(&env)?;
+        if env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        merchant.require_auth();
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
+        {
+            return Err(Error::Paused);
+        }
+        let amount = strategy::distribute(&env)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        release_reentrancy_lock(&env);
+        Ok(amount)
+    }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::YieldStrategy, &strategy);
-        persist_yield_ttl(&env, &DataKey::YieldStrategy);
-
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
-        Ok(())
+    /// Recall **all** deployed principal from the active strategy (issue
+    /// #415). Admin only. Unlike the other yield entry points this works
+    /// while the vault is paused, so capital can always be brought home.
+    /// Returns the principal recalled.
+    pub fn emergency_exit_yield(env: Env) -> Result<i128, Error> {
+        acquire_reentrancy_lock(&env)?;
+        let principal = strategy::emergency_exit(&env)?;
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+        release_reentrancy_lock(&env);
+        Ok(principal)
     }
 
     /// Set the minimum reserve ratio in basis points (1 bp = 0.01%).
@@ -2158,9 +2132,7 @@ impl RefundVault {
             .set(&DataKey::ReserveRatio, &basis_points);
         persist_yield_ttl(&env, &DataKey::ReserveRatio);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2183,9 +2155,7 @@ impl RefundVault {
             .set(&DataKey::MaxDeployRatio, &basis_points);
         persist_yield_ttl(&env, &DataKey::MaxDeployRatio);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2224,6 +2194,9 @@ impl RefundVault {
             .persistent()
             .get(&DataKey::YieldStrategy)
             .ok_or(Error::StrategyNotSet)?;
+        if !strategy::is_approved(&env, &strategy) {
+            return Err(Error::StrategyNotApproved);
+        }
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
@@ -2293,9 +2266,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         release_reentrancy_lock(&env);
         Ok(())
     }
@@ -2333,47 +2304,12 @@ impl RefundVault {
             .get(&DataKey::YieldStrategy)
             .ok_or(Error::StrategyNotSet)?;
 
-        let deployed: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DeployedPrincipal)
-            .unwrap_or(0);
-        if principal > deployed {
-            return Err(Error::NothingToWithdraw);
-        }
+        // Books the principal/yield split and emits `YieldWithdrawnEvent`,
+        // cross-checking the strategy's report against the actual token
+        // balance delta (issue #415).
+        strategy::recall_principal(&env, &strategy, principal)?;
 
-        let strategy_client = YieldStrategyClient::new(&env, &strategy);
-        let (principal_returned, yield_returned) = strategy_client.withdraw(&principal);
-
-        let harvested: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::HarvestedYield)
-            .unwrap_or(0);
-
-        env.storage().persistent().set(
-            &DataKey::DeployedPrincipal,
-            &(deployed - principal_returned),
-        );
-        env.storage()
-            .persistent()
-            .set(&DataKey::HarvestedYield, &(harvested + yield_returned));
-        persist_yield_ttl(&env, &DataKey::DeployedPrincipal);
-        persist_yield_ttl(&env, &DataKey::HarvestedYield);
-
-        let nonce = increment_nonce(&env);
-
-        YieldWithdrawnEvent {
-            strategy,
-            principal: principal_returned,
-            yield_amount: yield_returned,
-            nonce,
-        }
-        .publish(&env);
-
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         release_reentrancy_lock(&env);
         Ok(())
     }
@@ -2430,9 +2366,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         release_reentrancy_lock(&env);
         Ok(())
     }
@@ -2481,9 +2415,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2501,10 +2433,45 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
+    }
+
+    /// Configure the dust sweep (issue #427): residual balances strictly
+    /// below `threshold` are sweepable, and swept dust is sent to
+    /// `treasury`. Merchant (admin) only.
+    ///
+    /// # Errors
+    /// - `InvalidAmount`: `threshold <= 0`.
+    /// - `SelfTransfer`: `treasury` is the vault itself.
+    pub fn set_dust_config(env: Env, threshold: i128, treasury: Address) -> Result<(), Error> {
+        dust::set_dust_config(&env, threshold, treasury)
+    }
+
+    /// Current dust threshold (defaults to [`dust::DEFAULT_DUST_THRESHOLD`]).
+    pub fn get_dust_threshold(env: Env) -> i128 {
+        dust::dust_threshold(&env)
+    }
+
+    /// Address that receives swept dust.
+    pub fn get_dust_treasury(env: Env) -> Address {
+        dust::dust_treasury(&env)
+    }
+
+    /// Sweep the unrefunded remainder of `payment_ref`'s escrow to the dust
+    /// treasury and delete its refund record (issue #427). Merchant (admin)
+    /// only. Returns the amount swept (`0` when the record was fully
+    /// refunded and is only reclaimed).
+    ///
+    /// # Errors
+    /// - `RefundNotFound`: no refund record exists for `payment_ref`.
+    /// - `InvalidAmount`: the remainder is not strictly below the dust
+    ///   threshold.
+    /// - `TimelockNotExpired`: the escrow has not been closed for more than
+    ///   [`dust::DUST_SWEEP_DELAY_LEDGERS`] ledgers.
+    /// - `InsufficientFloat`: the vault cannot cover the remainder.
+    pub fn sweep_dust(env: Env, payment_ref: BytesN<32>) -> Result<i128, Error> {
+        dust::sweep_dust(&env, payment_ref)
     }
 
     pub fn extend_refund_ttl(env: Env, payment_ref: BytesN<32>) -> Result<(), Error> {
@@ -2552,9 +2519,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2581,9 +2546,7 @@ impl RefundVault {
         }
         .publish(&env);
 
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -2604,11 +2567,18 @@ impl RefundVault {
 }
 
 #[cfg(test)]
+mod dust_tests;
+#[cfg(test)]
 mod fuzz_test;
 #[cfg(test)]
 mod oracle_tests;
 #[cfg(test)]
 mod reentrancy_tests;
+#[cfg(test)]
+mod settlement_test;
+/// Yield-bearing escrow strategy hook tests (issue #415).
+#[cfg(test)]
+mod strategy_tests;
 #[cfg(test)]
 mod test;
 #[cfg(test)]

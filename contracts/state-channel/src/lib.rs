@@ -1,11 +1,29 @@
 #![no_std]
 
 #[cfg(test)]
+mod close_test;
+#[cfg(test)]
+mod crypto_test;
+#[cfg(test)]
+mod delegation_test;
+#[cfg(test)]
+mod htlc_test;
+#[cfg(test)]
+mod multi_asset_test;
+#[cfg(test)]
+mod splice_test;
+#[cfg(test)]
 mod test;
+#[cfg(test)]
+mod watchtower_test;
 
-use accensa_common::Error;
+use accensa_common::{storage::extend_instance_ttl, Error};
+use close::MutualCloseState;
+use multi_asset::{MultiAssetChannel, MultiAssetState};
+use nonce::NonceWindow;
 use soroban_sdk::{
     contract, contractevent, contractimpl, contractmeta, contracttype, Address, Bytes, BytesN, Env,
+    Map,
 };
 
 contractmeta!(key = "name", val = "StateChannel");
@@ -57,6 +75,10 @@ pub struct Channel {
     pub challenge_period: u32,
     /// Ed25519 public key used to verify off-chain state signatures.
     pub sender_pubkey: BytesN<32>,
+    /// Sliding-window bitmap of consumed nonces (issue #374). Accepts
+    /// in-window nonces exactly once, in any order, and rejects replays
+    /// even after the window has slid past them.
+    pub nonce_window: NonceWindow,
 }
 
 /// A signed state update submitted by anyone.
@@ -78,6 +100,20 @@ pub enum DataKey {
     Token,
     /// Maximum number of ledgers a channel can stay open before it expires.
     MaxChannelLifetime,
+    /// Persistent: a multi-asset channel (issue #423). Shares the
+    /// `ChannelCount` id sequence with single-asset channels.
+    MultiAssetChannel(u64),
+    /// Instance: the receiver's Ed25519 key for a channel, used to verify
+    /// its half of a mutual close (issue #412).
+    ReceiverPubkey(u64),
+    /// Persistent: a single HTLC hop on a channel (issue #458).
+    Htlc(u64, u64),
+    /// Persistent: number of HTLC hops ever added to a channel.
+    HtlcCount(u64),
+    /// Persistent: total escrow reserved by a channel's pending HTLCs.
+    HtlcReserved(u64),
+    /// Instance: a channel's watchtower bounty configuration (issue #459).
+    Bounty(u64),
 }
 
 /// Emitted when a channel is opened.
@@ -159,6 +195,15 @@ const DEFAULT_MAX_CHANNEL_LIFETIME: u32 = 1_209_600;
 const TTL_EXTEND: u32 = 518_400;
 const TTL_THRESHOLD: u32 = 100;
 
+/// `0` selects the default challenge period; anything larger is capped.
+fn effective_challenge_period(challenge_period: u32) -> u32 {
+    if challenge_period == 0 {
+        DEFAULT_CHALLENGE_PERIOD
+    } else {
+        challenge_period.min(MAX_CHALLENGE_PERIOD)
+    }
+}
+
 #[contract]
 pub struct StateChannel;
 
@@ -174,9 +219,7 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::MaxChannelLifetime, &DEFAULT_MAX_CHANNEL_LIFETIME);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -215,11 +258,7 @@ impl StateChannel {
             .unwrap_or(0)
             + 1;
 
-        let effective_challenge = if challenge_period == 0 {
-            DEFAULT_CHALLENGE_PERIOD
-        } else {
-            challenge_period.min(MAX_CHALLENGE_PERIOD)
-        };
+        let effective_challenge = effective_challenge_period(challenge_period);
 
         let channel = Channel {
             sender: sender.clone(),
@@ -233,6 +272,7 @@ impl StateChannel {
             disputed_at: 0,
             challenge_period: effective_challenge,
             sender_pubkey,
+            nonce_window: NonceWindow::empty(&env),
         };
 
         env.storage()
@@ -241,9 +281,7 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::ChannelCount, &channel_id);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         ChannelOpenedEvent {
             channel_id,
@@ -272,20 +310,86 @@ impl StateChannel {
 
         Self::verify_state_signature(&env, &channel, &state, &signature)?;
 
-        if state.nonce <= channel.nonce {
-            return Err(Error::StaleState);
-        }
-
-        if state.balance < 0 || state.balance > channel.amount {
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
             return Err(Error::ExceedsPayment);
         }
+        // The receiver's entitlement may only grow: a signed state that
+        // regresses the balance is stale even when its nonce is fresh.
+        if state.balance < channel.balance {
+            return Err(Error::StaleState);
+        }
+        // Consume the nonce in the sliding window; a replay or a nonce that
+        // already slid out of range is rejected here (issue #374).
+        channel.nonce_window.consume(&env, state.nonce)?;
 
-        channel.nonce = state.nonce;
+        channel.nonce = channel.nonce.max(state.nonce);
         channel.balance = state.balance;
 
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+
+        StateUpdatedEvent {
+            channel_id,
+            nonce: state.nonce,
+            balance: state.balance,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Submit a state update signed by a delegated ephemeral key.
+    pub fn update_state_delegated(
+        env: Env,
+        channel_id: u64,
+        state: StateUpdate,
+        signature: BytesN<64>,
+        certificate: DelegationCertificate,
+        cert_signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        let mut channel = Self::get_channel_internal(&env, channel_id)?;
+
+        if channel.phase != ChannelPhase::Open {
+            return Err(Error::ChannelNotOpen);
+        }
+
+        Self::verify_delegated_state_signature(
+            &env,
+            &channel,
+            channel_id,
+            &state,
+            &signature,
+            &certificate,
+            &cert_signature,
+        )?;
+
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
+            return Err(Error::ExceedsPayment);
+        }
+        if state.balance < channel.balance {
+            return Err(Error::StaleState);
+        }
+        channel.nonce_window.consume(&env, state.nonce)?;
+
+        channel.nonce = channel.nonce.max(state.nonce);
+        channel.balance = state.balance;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         StateUpdatedEvent {
             channel_id,
@@ -321,11 +425,23 @@ impl StateChannel {
 
         Self::verify_state_signature(&env, &channel, &state, &signature)?;
 
-        if state.balance < 0 || state.balance > channel.amount {
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
             return Err(Error::ExceedsPayment);
         }
 
-        channel.nonce = state.nonce;
+        // A cooperative close is signed by the sender, so its nonce need not
+        // beat `channel.nonce` — but it must never lower the recorded
+        // high-water mark, and its nonce is consumed best-effort: reusing an
+        // already-consumed nonce at close time is tolerated (the sender may
+        // co-sign a close with the last submitted state), while a fresh one
+        // joins the window so it cannot be replayed later.
+        let _ = channel.nonce_window.consume(&env, state.nonce);
+        channel.nonce = channel.nonce.max(state.nonce);
         channel.balance = state.balance;
         channel.phase = ChannelPhase::Closed;
         channel.closed_at = env.ledger().sequence();
@@ -333,6 +449,71 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
+
+        ChannelClosedEvent {
+            channel_id,
+            balance: state.balance,
+            closed_at: channel.closed_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Cooperatively close the channel using a state signed by a delegated ephemeral key.
+    pub fn close_channel_delegated(
+        env: Env,
+        channel_id: u64,
+        state: StateUpdate,
+        signature: BytesN<64>,
+        certificate: DelegationCertificate,
+        cert_signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        let mut channel = Self::get_channel_internal(&env, channel_id)?;
+
+        if channel.phase != ChannelPhase::Open {
+            return Err(Error::ChannelNotOpen);
+        }
+
+        let max_lifetime: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxChannelLifetime)
+            .unwrap_or(DEFAULT_MAX_CHANNEL_LIFETIME);
+        if env.ledger().sequence() > channel.opened_at + max_lifetime {
+            return Err(Error::ChannelExpired);
+        }
+
+        Self::verify_delegated_state_signature(
+            &env,
+            &channel,
+            channel_id,
+            &state,
+            &signature,
+            &certificate,
+            &cert_signature,
+        )?;
+
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
+            return Err(Error::ExceedsPayment);
+        }
+
+        let _ = channel.nonce_window.consume(&env, state.nonce);
+        channel.nonce = channel.nonce.max(state.nonce);
+        channel.balance = state.balance;
+        channel.phase = ChannelPhase::Closed;
+        channel.closed_at = env.ledger().sequence();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         ChannelClosedEvent {
             channel_id,
@@ -367,15 +548,21 @@ impl StateChannel {
 
         Self::verify_state_signature(&env, &channel, &state, &signature)?;
 
-        if state.nonce <= channel.nonce {
-            return Err(Error::StaleState);
-        }
-
-        if state.balance < 0 || state.balance > channel.amount {
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
             return Err(Error::ExceedsPayment);
         }
+        // Disputed state must not regress the recorded balance (issue #374).
+        if state.balance < channel.balance {
+            return Err(Error::StaleState);
+        }
+        channel.nonce_window.consume(&env, state.nonce)?;
 
-        channel.nonce = state.nonce;
+        channel.nonce = channel.nonce.max(state.nonce);
         channel.balance = state.balance;
         channel.phase = ChannelPhase::Disputed;
         channel.disputed_at = env.ledger().sequence();
@@ -383,6 +570,7 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         DisputeEvent {
             channel_id,
@@ -416,21 +604,28 @@ impl StateChannel {
 
         Self::verify_state_signature(&env, &channel, &state, &signature)?;
 
-        if state.nonce <= channel.nonce {
-            return Err(Error::StaleState);
-        }
-
-        if state.balance < 0 || state.balance > channel.amount {
+        if state.balance < 0
+            || state
+                .balance
+                .checked_add(htlc::reserved(&env, channel_id))
+                .is_none_or(|committed| committed > channel.amount)
+        {
             return Err(Error::ExceedsPayment);
         }
+        // Counter-evidence must advance the balance, not regress it.
+        if state.balance < channel.balance {
+            return Err(Error::StaleState);
+        }
+        channel.nonce_window.consume(&env, state.nonce)?;
 
-        channel.nonce = state.nonce;
+        channel.nonce = channel.nonce.max(state.nonce);
         channel.balance = state.balance;
         channel.disputed_at = env.ledger().sequence();
 
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         StateUpdatedEvent {
             channel_id,
@@ -462,8 +657,12 @@ impl StateChannel {
             .get(&DataKey::Token)
             .ok_or(Error::NotInitialized)?;
 
-        let receiver_payout = channel.balance;
+        let gross_receiver_payout = channel.balance;
         let sender_refund = channel.amount - channel.balance;
+        // A successful watchtower defense is paid out of the receiver's
+        // recovery, never the sender's refund (issue #459).
+        let (watchtower_reward, receiver_payout, watchtower_addr) =
+            watchtower::take_reward(&env, channel_id, gross_receiver_payout)?;
 
         let contract_addr = env.current_contract_address();
         let tok = soroban_sdk::token::Client::new(&env, &token);
@@ -473,12 +672,18 @@ impl StateChannel {
         if sender_refund > 0 {
             tok.transfer(&contract_addr, &channel.sender, &sender_refund);
         }
+        if watchtower_reward > 0 {
+            if let Some(watchtower) = watchtower_addr {
+                tok.transfer(&contract_addr, &watchtower, &watchtower_reward);
+            }
+        }
 
         channel.phase = ChannelPhase::Finalized;
 
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         DisputeFinalizedEvent {
             channel_id,
@@ -525,6 +730,7 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         ClaimEvent {
             channel_id,
@@ -567,6 +773,7 @@ impl StateChannel {
         env.storage()
             .instance()
             .set(&DataKey::Channel(channel_id), &channel);
+        extend_instance_ttl(&env, TTL_THRESHOLD, TTL_EXTEND);
 
         if refund > 0 {
             let contract_addr = env.current_contract_address();
@@ -583,6 +790,13 @@ impl StateChannel {
     /// Read a channel record.
     pub fn get_channel(env: Env, channel_id: u64) -> Result<Channel, Error> {
         Self::get_channel_internal(&env, channel_id)
+    }
+
+    /// Read-only: the channel's current sliding-window nonce bitmap
+    /// (issue #374). Useful for indexers reconstructing which nonces inside
+    /// the live window have already been consumed.
+    pub fn get_nonce_window(env: Env, channel_id: u64) -> Result<NonceWindow, Error> {
+        Ok(Self::get_channel_internal(&env, channel_id)?.nonce_window)
     }
 
     /// Returns the total number of channels opened.
@@ -619,6 +833,188 @@ impl StateChannel {
             .unwrap_or(DEFAULT_MAX_CHANNEL_LIFETIME)
     }
 
+    // ── Cooperative mutual close (issue #412) ────────────────────────────
+
+    /// Register (or replace) the receiver's Ed25519 key for `channel_id`.
+    /// Must be authorized by the channel's receiver. See [`close`].
+    pub fn register_receiver_key(
+        env: Env,
+        channel_id: u64,
+        receiver_pubkey: BytesN<32>,
+    ) -> Result<(), Error> {
+        close::register_receiver_key(&env, channel_id, receiver_pubkey)
+    }
+
+    /// The receiver's registered Ed25519 key for `channel_id`, if any.
+    pub fn get_receiver_key(env: Env, channel_id: u64) -> Option<BytesN<32>> {
+        close::receiver_key(&env, channel_id)
+    }
+
+    /// Settle a channel instantly with a final balance distribution signed
+    /// by both the sender (`sig_a`) and the receiver (`sig_b`). Skips the
+    /// challenge window, pays both parties and deletes the channel record.
+    pub fn mutual_close(
+        env: Env,
+        final_state: MutualCloseState,
+        sig_a: BytesN<64>,
+        sig_b: BytesN<64>,
+    ) -> Result<(), Error> {
+        close::mutual_close(&env, final_state, sig_a, sig_b)
+    }
+
+    // ── Multi-asset channels (issue #423) ────────────────────────────────
+
+    /// Open a channel escrowing several tokens at once. `deposits` maps each
+    /// token address to the amount `sender` locks in it (1..=`MAX_ASSETS`
+    /// tokens, every amount positive). See [`multi_asset`].
+    pub fn open_multi_asset_channel(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        sender_pubkey: BytesN<32>,
+        deposits: Map<Address, i128>,
+        challenge_period: u32,
+    ) -> Result<u64, Error> {
+        multi_asset::open(
+            &env,
+            sender,
+            receiver,
+            sender_pubkey,
+            deposits,
+            challenge_period,
+        )
+    }
+
+    /// Submit a newer sender-signed multi-asset state, while the channel is
+    /// open or during the post-close challenge window.
+    pub fn update_multi_asset_state(
+        env: Env,
+        channel_id: u64,
+        state: MultiAssetState,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        multi_asset::update(&env, channel_id, state, signature)
+    }
+
+    /// Close a multi-asset channel with a signed state and start the
+    /// challenge window.
+    pub fn close_multi_asset_channel(
+        env: Env,
+        channel_id: u64,
+        state: MultiAssetState,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        multi_asset::close(&env, channel_id, state, signature)
+    }
+
+    /// Settle every asset of a multi-asset channel in one atomic call.
+    pub fn settle_multi_asset_channel(env: Env, channel_id: u64) -> Result<(), Error> {
+        multi_asset::settle(&env, channel_id)
+    }
+
+    /// Read a multi-asset channel record.
+    pub fn get_multi_asset_channel(env: Env, channel_id: u64) -> Result<MultiAssetChannel, Error> {
+        multi_asset::get(&env, channel_id)
+    }
+
+    // ── Virtual multi-hop HTLCs (issue #458) ─────────────────────────────
+
+    /// Lock `amount` of the channel's free escrow against `hash_lock`,
+    /// expiring at `timeout_ledger`. `parent` optionally links this hop to an
+    /// upstream hop that must expire strictly later. Returns the new
+    /// `htlc_id`. Sender-authorized. See [`htlc`].
+    pub fn add_htlc(
+        env: Env,
+        channel_id: u64,
+        hash_lock: BytesN<32>,
+        amount: i128,
+        timeout_ledger: u32,
+        parent: Option<htlc::HtlcRef>,
+    ) -> Result<u64, Error> {
+        htlc::add(&env, channel_id, hash_lock, amount, timeout_ledger, parent)
+    }
+
+    /// Resolve a pending hop with `preimage`, crediting the receiver's
+    /// balance. Permissionless. See [`htlc`].
+    pub fn resolve_htlc(
+        env: Env,
+        channel_id: u64,
+        htlc_id: u64,
+        preimage: Bytes,
+    ) -> Result<(), Error> {
+        htlc::resolve(&env, channel_id, htlc_id, preimage)
+    }
+
+    /// Refund a timed-out hop back to the sender's free escrow.
+    /// Permissionless once `timeout_ledger` has passed. See [`htlc`].
+    pub fn refund_htlc(env: Env, channel_id: u64, htlc_id: u64) -> Result<(), Error> {
+        htlc::refund(&env, channel_id, htlc_id)
+    }
+
+    /// Read a single HTLC hop.
+    pub fn get_htlc(env: Env, channel_id: u64, htlc_id: u64) -> Result<htlc::Htlc, Error> {
+        htlc::get(&env, channel_id, htlc_id)
+    }
+
+    /// Read-only: total escrow currently reserved by a channel's pending
+    /// HTLCs.
+    pub fn get_htlc_reserved(env: Env, channel_id: u64) -> i128 {
+        htlc::reserved(&env, channel_id)
+    }
+
+    // ── Channel splicing (issue #460) ────────────────────────────────────
+
+    /// Add `amount` of new funds to an open channel's capacity. Requires both
+    /// the sender's and the receiver's authorization. See [`splice`].
+    pub fn splice_in(env: Env, channel_id: u64, amount: i128) -> Result<(), Error> {
+        splice::splice_in(&env, channel_id, amount)
+    }
+
+    /// Withdraw `amount` of the sender's free escrow from an open channel.
+    /// Requires both the sender's and the receiver's authorization.
+    /// See [`splice`].
+    pub fn splice_out(env: Env, channel_id: u64, amount: i128) -> Result<(), Error> {
+        splice::splice_out(&env, channel_id, amount)
+    }
+
+    /// Read-only: the sender's uncommitted escrow (capacity minus the
+    /// receiver's balance and any pending HTLC reservations).
+    pub fn get_channel_free_balance(env: Env, channel_id: u64) -> Result<i128, Error> {
+        let channel = Self::get_channel_internal(&env, channel_id)?;
+        splice::free_balance(&env, channel_id, &channel)
+    }
+
+    // ── Watchtower reward bounties (issue #459) ──────────────────────────
+
+    /// Configure the bounty paid to a watchtower for a successful
+    /// counter-proof on `channel_id`. Receiver-authorized; capped at
+    /// [`watchtower::MAX_REWARD_BPS`]. See [`watchtower`].
+    pub fn set_watchtower_bounty(env: Env, channel_id: u64, reward_bps: u32) -> Result<(), Error> {
+        watchtower::set_bounty(&env, channel_id, reward_bps)
+    }
+
+    /// Read-only: the configured watchtower reward for `channel_id`, in basis
+    /// points (`0` if unset).
+    pub fn get_watchtower_bounty(env: Env, channel_id: u64) -> u32 {
+        watchtower::reward_bps(&env, channel_id)
+    }
+
+    /// Submit sender-signed counter-evidence during an active dispute *as a
+    /// watchtower*, recording `watchtower` as the channel's defender so it is
+    /// paid the configured bounty at settlement. See [`watchtower`].
+    pub fn watchtower_counter_evidence(
+        env: Env,
+        channel_id: u64,
+        state: StateUpdate,
+        signature: BytesN<64>,
+        watchtower: Address,
+    ) -> Result<(), Error> {
+        watchtower.require_auth();
+        Self::submit_counter_evidence(env.clone(), channel_id, state, signature)?;
+        watchtower::record(&env, channel_id, watchtower);
+        Ok(())
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     fn get_channel_internal(env: &Env, channel_id: u64) -> Result<Channel, Error> {
@@ -646,6 +1042,28 @@ impl StateChannel {
         env.crypto()
             .ed25519_verify(&channel.sender_pubkey, &payload, signature);
         Ok(())
+    }
+
+    /// Verify that `signature` is a valid Ed25519 signature by the delegated
+    /// ephemeral key authorized by `certificate`.
+    fn verify_delegated_state_signature(
+        env: &Env,
+        channel: &Channel,
+        channel_id: u64,
+        state: &StateUpdate,
+        signature: &BytesN<64>,
+        certificate: &DelegationCertificate,
+        cert_signature: &BytesN<64>,
+    ) -> Result<(), Error> {
+        let payload = Self::state_payload(env, channel, state);
+        certificate.verify_delegated_state_signature(
+            env,
+            cert_signature,
+            &channel.sender_pubkey,
+            channel_id,
+            &payload,
+            signature,
+        )
     }
 
     /// Build the canonical byte representation of a state update for signing.
@@ -682,8 +1100,18 @@ impl StateChannel {
         Ok(())
     }
 }
+pub mod close;
+pub mod crypto;
+pub mod delegation;
 pub mod dispute;
 pub mod epoch;
+pub mod htlc;
+pub mod multi_asset;
+pub mod nonce;
+pub mod splice;
+pub mod watchtower;
+
+pub use delegation::DelegationCertificate;
 
 /// HTLC parameters for cross-chain swaps.
 #[contracttype]

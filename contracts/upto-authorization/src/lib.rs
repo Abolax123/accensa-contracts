@@ -2,8 +2,14 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contractmeta, contracttype, token,
-    Address, BytesN, Env,
+    Address, Bytes, BytesN, Env,
 };
+
+mod domain;
+pub mod inactivity;
+mod types;
+
+pub use types::{max_settleable, AuthorizationRecord, BPS_DENOMINATOR, MAX_SLIPPAGE_BPS};
 
 contractmeta!(key = "name", val = "UptoAuthorization");
 contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
@@ -25,6 +31,16 @@ pub enum Error {
     InvalidAmount = 7,
     AuthorizationNotFound = 8,
     AllowanceFailed = 9,
+    /// `authorize_signed` was called for a buyer with no registered
+    /// Ed25519 signer key (issue #416).
+    SignerNotRegistered = 10,
+    /// `max_slippage_bps` is above [`MAX_SLIPPAGE_BPS`].
+    InvalidSlippage = 11,
+    /// `cap` plus its slippage tolerance does not fit in an `i128`.
+    AmountOverflow = 12,
+    /// A dormancy cancellation was attempted before the authorization's
+    /// `expiry + inactivity_timeout` had passed (issue #435).
+    NotInactive = 13,
 }
 
 #[contracttype]
@@ -32,22 +48,18 @@ pub enum DataKey {
     Admin,
     Token,
     Authorization(BytesN<32>),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizationRecord {
-    pub from: Address,
-    pub to: Address,
-    pub cap: i128,
-    pub expiry: u32,
-    pub consumed: bool,
+    /// Persistent: the Ed25519 public key authorized to sign
+    /// `authorize_signed` digests for this buyer address (issue #416).
+    Signer(Address),
+    /// Instance: the dormancy window, in ledgers, used by
+    /// [`UptoAuthorization::cancel_inactive_escrow`] (issue #435).
+    InactivityTimeout,
 }
 
 /// Emitted when a buyer authorizes a payment cap.
 ///
 /// Topics: `("authorize_event", payment_id)`. The data map contains
-/// `from`, `to`, `cap`, and `expiry`.
+/// `from`, `to`, `cap`, `expiry`, and `max_slippage_bps`.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizeEvent {
@@ -57,6 +69,8 @@ pub struct AuthorizeEvent {
     pub to: Address,
     pub cap: i128,
     pub expiry: u32,
+    /// Slippage tolerated above `cap`, in basis points (`0` = none).
+    pub max_slippage_bps: u32,
 }
 
 /// Emitted when a payment is settled.
@@ -111,6 +125,9 @@ impl UptoAuthorization {
     /// The contract records the authorization and calls `approve` on the token
     /// to grant itself the allowance. The buyer's auth entry must cover both
     /// this call and the nested `approve` call.
+    ///
+    /// Settlement is capped at exactly `cap`; see
+    /// [`Self::authorize_with_slippage`] to tolerate price movement.
     pub fn authorize(
         env: Env,
         payment_id: BytesN<32>,
@@ -119,9 +136,34 @@ impl UptoAuthorization {
         cap: i128,
         expiry: u32,
     ) -> Result<(), Error> {
+        Self::authorize_with_slippage(env, payment_id, from, to, cap, expiry, 0)
+    }
+
+    /// Like [`Self::authorize`], but `settle` may charge up to
+    /// `cap + floor(cap * max_slippage_bps / 10_000)` to absorb price movement
+    /// in cross-currency settlements. The buyer's signature covers
+    /// `max_slippage_bps`, and the token allowance is granted for that full
+    /// maximum so `transfer_from` can cover it.
+    ///
+    /// Fails with [`Error::InvalidSlippage`] if `max_slippage_bps` exceeds
+    /// [`MAX_SLIPPAGE_BPS`], or [`Error::AmountOverflow`] if the maximum does
+    /// not fit in an `i128`.
+    pub fn authorize_with_slippage(
+        env: Env,
+        payment_id: BytesN<32>,
+        from: Address,
+        to: Address,
+        cap: i128,
+        expiry: u32,
+        max_slippage_bps: u32,
+    ) -> Result<(), Error> {
         if cap <= 0 {
             return Err(Error::InvalidAmount);
         }
+        if max_slippage_bps > MAX_SLIPPAGE_BPS {
+            return Err(Error::InvalidSlippage);
+        }
+        let max_amount = max_settleable(cap, max_slippage_bps).ok_or(Error::AmountOverflow)?;
 
         // The buyer must authorize this call — they are granting the contract
         // a SEP-41 allowance. In production, the buyer signs one auth entry
@@ -156,7 +198,7 @@ impl UptoAuthorization {
         // Get the token and approve the allowance.
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
-        client.approve(&from, &env.current_contract_address(), &cap, &expiry);
+        client.approve(&from, &env.current_contract_address(), &max_amount, &expiry);
 
         // Record the authorization.
         let record = AuthorizationRecord {
@@ -165,6 +207,8 @@ impl UptoAuthorization {
             cap,
             expiry,
             consumed: false,
+            max_slippage_bps,
+            created_ledger: env.ledger().sequence(),
         };
 
         env.storage()
@@ -186,10 +230,124 @@ impl UptoAuthorization {
             to,
             cap,
             expiry,
+            max_slippage_bps,
         }
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Register the Ed25519 public key whose signatures
+    /// [`authorize_signed`](Self::authorize_signed) will accept for `buyer`
+    /// (issue #416).
+    ///
+    /// `buyer.require_auth()`, so only the buyer can bind a key to their
+    /// address (or a contract acting as the buyer under its own auth rules).
+    /// Binding via storage — instead of deriving the key from the address —
+    /// keeps this usable for contract-address buyers, which cannot produce
+    /// Ed25519 signatures themselves.
+    pub fn register_signer(
+        env: Env,
+        buyer: Address,
+        signer_pubkey: BytesN<32>,
+    ) -> Result<(), Error> {
+        buyer.require_auth();
+        let key = DataKey::Signer(buyer);
+        env.storage().persistent().set(&key, &signer_pubkey);
+        // Threshold == extend_to so a freshly-written entry (already at the
+        // network minimum TTL) is actually extended, not silently skipped.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_EXTEND, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Read-only: the registered signer key for `buyer`, if any (issue #416).
+    pub fn get_signer(env: Env, buyer: Address) -> Option<BytesN<32>> {
+        env.storage().persistent().get(&DataKey::Signer(buyer))
+    }
+
+    /// Read-only: this deployment's domain separator (issue #416) —
+    /// `sha256(network_id ‖ contract_address ‖ protocol_version)`. Fetch
+    /// this (or the digest below) when constructing an off-chain signature;
+    /// never hardcode it.
+    pub fn get_domain_separator(env: Env) -> BytesN<32> {
+        domain::compute_domain_separator(&env)
+    }
+
+    /// Read-only: the exact digest `authorize_signed` will verify against
+    /// (issue #416). Sign these 32 bytes with the registered Ed25519 key;
+    /// the returned value already includes the domain separator, so a
+    /// signature produced for it is bound to this network and this contract
+    /// address.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_authorization_digest(
+        env: Env,
+        payment_id: BytesN<32>,
+        from: Address,
+        to: Address,
+        cap: i128,
+        expiry: u32,
+    ) -> BytesN<32> {
+        domain::authorization_digest(
+            &env,
+            &domain::compute_domain_separator(&env),
+            &payment_id,
+            &from,
+            &to,
+            cap,
+            expiry,
+        )
+    }
+
+    /// [`authorize`](Self::authorize) gated by an Ed25519 signature over the
+    /// domain-separated digest (issue #416).
+    ///
+    /// The signature covers `network_id`, this contract's address, the
+    /// protocol version, and the full authorization tuple, so a signature
+    /// made on another network (or for another payment/cap) never verifies:
+    /// `ed25519_verify` traps and the whole invocation rolls back before any
+    /// allowance is granted. After verification the call proceeds through
+    /// the regular [`authorize`](Self::authorize) path — `from.require_auth`
+    /// still runs (the nested token `approve` needs it) — so the signature
+    /// is an *additional* binding, not a replacement for host auth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_signed(
+        env: Env,
+        payment_id: BytesN<32>,
+        from: Address,
+        to: Address,
+        cap: i128,
+        expiry: u32,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        let signer: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Signer(from.clone()))
+            .ok_or(Error::SignerNotRegistered)?;
+        env.storage().persistent().extend_ttl(
+            &DataKey::Signer(from.clone()),
+            TTL_EXTEND,
+            TTL_EXTEND,
+        );
+
+        let digest = domain::authorization_digest(
+            &env,
+            &domain::compute_domain_separator(&env),
+            &payment_id,
+            &from,
+            &to,
+            cap,
+            expiry,
+        );
+        let msg = Bytes::from(digest);
+        // Traps on mismatch: a signature forged for a different network,
+        // contract address, payment, recipient, cap, or expiry is rejected
+        // here, before `authorize` touches any storage or allowance.
+        env.crypto().ed25519_verify(&signer, &msg, &signature);
+
+        Self::authorize(env, payment_id, from, to, cap, expiry)
     }
 
     /// Settle a payment. The facilitator calls this with the actual amount
@@ -229,8 +387,9 @@ impl UptoAuthorization {
             return Err(Error::Expired);
         }
 
-        // Check actual <= cap.
-        if actual > record.cap {
+        // Check actual <= cap + slippage tolerance.
+        let max_amount = record.max_settleable().ok_or(Error::AmountOverflow)?;
+        if actual > max_amount {
             return Err(Error::AmountExceedsCap);
         }
 
@@ -244,7 +403,7 @@ impl UptoAuthorization {
             &actual,
         );
 
-        // Zero out the allowance so cap - actual doesn't linger.
+        // Zero out the allowance so max_amount - actual doesn't linger.
         token_client.approve(
             &record.from,
             &env.current_contract_address(),
@@ -347,6 +506,37 @@ impl UptoAuthorization {
             .get(&DataKey::Authorization(payment_id))
     }
 
+    /// Admin-only: set the dormancy window used by
+    /// [`Self::cancel_inactive_escrow`], in ledgers (issue #435). Defaults to
+    /// ~30 days.
+    pub fn set_inactivity_timeout(env: Env, ledgers: u32) -> Result<(), Error> {
+        inactivity::set_inactivity_timeout(&env, ledgers)
+    }
+
+    /// Read-only: the dormancy window, in ledgers (issue #435).
+    pub fn get_inactivity_timeout(env: Env) -> u32 {
+        inactivity::inactivity_timeout(&env)
+    }
+
+    /// Buyer-triggered cancellation of a dormant payment authorization
+    /// (issue #435).
+    ///
+    /// Once at least `inactivity_timeout` ledgers have elapsed since the
+    /// authorization was created with no `settle`, the buyer may release their
+    /// own locked allowance and delete the dead record, without any
+    /// merchant/facilitator signature. Returns the cap that was released.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AuthorizationNotFound`], [`Error::AlreadySettled`], or
+    /// [`Error::NotInactive`].
+    ///
+    /// # Events emitted on success
+    /// - [`inactivity::EscrowCancelledInactivity`]
+    pub fn cancel_inactive_escrow(env: Env, payment_id: BytesN<32>) -> Result<i128, Error> {
+        inactivity::cancel_inactive_escrow(&env, payment_id)
+    }
+
     /// Extend the TTL of an authorization record.
     pub fn extend_authorization_ttl(env: Env, payment_id: BytesN<32>) -> Result<(), Error> {
         if !env
@@ -366,4 +556,5 @@ impl UptoAuthorization {
 }
 
 mod fuzz_test;
+mod inactivity_test;
 mod test;

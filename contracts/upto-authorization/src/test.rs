@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{StellarAssetClient, TokenClient},
@@ -9,15 +10,20 @@ use soroban_sdk::{
 
 const TOKEN_SUPPLY: i128 = 10_000_000;
 
-fn setup() -> (
+pub(crate) type Setup = (
     Env,
     UptoAuthorizationClient<'static>,
     Address,
     Address,
     Address,
     Address,
-) {
-    let env = Env::default();
+);
+
+fn setup() -> Setup {
+    setup_in(Env::default())
+}
+
+pub(crate) fn setup_in(env: Env) -> Setup {
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
@@ -321,6 +327,7 @@ fn test_authorize_event_emitted() {
         m.set(Symbol::new(&env, "cap"), 1000i128.into_val(&env));
         m.set(Symbol::new(&env, "expiry"), 1000u32.into_val(&env));
         m.set(Symbol::new(&env, "from"), buyer.into_val(&env));
+        m.set(Symbol::new(&env, "max_slippage_bps"), 0u32.into_val(&env));
         m.set(Symbol::new(&env, "to"), recipient.into_val(&env));
         m.into_val(&env)
     };
@@ -545,4 +552,385 @@ fn test_settle_exact_cap() {
     let tc = TokenClient::new(&env, &token);
     assert_eq!(tc.balance(&recipient), 500);
     assert_eq!(tc.balance(&buyer), TOKEN_SUPPLY - 500);
+}
+
+// ── Slippage tolerance ─────────────────────────────────────────────────────
+
+#[test]
+fn test_zero_bps_is_strict_cap() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    client.authorize_with_slippage(&p, &buyer, &recipient, &1000, &1000, &0);
+    assert_eq!(
+        client.try_settle(&p, &1001),
+        Err(Ok(Error::AmountExceedsCap))
+    );
+    client.settle(&p, &1000);
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 1000);
+}
+
+#[test]
+fn test_settle_within_slippage_succeeds() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    // 2.5% on 10_000 → up to 10_250.
+    client.authorize_with_slippage(&p, &buyer, &recipient, &10_000, &1000, &250);
+    client.settle(&p, &10_100);
+
+    let tc = TokenClient::new(&env, &token);
+    assert_eq!(tc.balance(&recipient), 10_100);
+    assert_eq!(tc.balance(&buyer), TOKEN_SUPPLY - 10_100);
+    // The unused headroom does not linger as an allowance.
+    assert_eq!(tc.allowance(&buyer, &client.address), 0);
+}
+
+#[test]
+fn test_settle_at_slippage_boundary() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let recipient = Address::generate(&env);
+
+    // Exactly at cap + tolerance succeeds …
+    let p1 = pid(&env, 1);
+    client.authorize_with_slippage(&p1, &buyer, &recipient, &10_000, &1000, &250);
+    client.settle(&p1, &10_250);
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 10_250);
+
+    // … one unit above fails.
+    let p2 = pid(&env, 2);
+    client.authorize_with_slippage(&p2, &buyer, &recipient, &10_000, &1000, &250);
+    assert_eq!(
+        client.try_settle(&p2, &10_251),
+        Err(Ok(Error::AmountExceedsCap))
+    );
+}
+
+#[test]
+fn test_slippage_tolerance_rounds_down() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    // 1 bps of 9_999 is 0.9999 → floors to 0, so the cap stays strict.
+    client.authorize_with_slippage(&p, &buyer, &recipient, &9_999, &1000, &1);
+    assert_eq!(
+        client.try_settle(&p, &10_000),
+        Err(Ok(Error::AmountExceedsCap))
+    );
+    client.settle(&p, &9_999);
+}
+
+#[test]
+fn test_max_slippage_bps_allows_double_cap() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    client.authorize_with_slippage(&p, &buyer, &recipient, &1000, &1000, &MAX_SLIPPAGE_BPS);
+    assert_eq!(
+        client.try_settle(&p, &2001),
+        Err(Ok(Error::AmountExceedsCap))
+    );
+    client.settle(&p, &2000);
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 2000);
+}
+
+#[test]
+fn test_slippage_above_max_rejected() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let recipient = Address::generate(&env);
+
+    for bps in [MAX_SLIPPAGE_BPS + 1, u32::MAX] {
+        assert_eq!(
+            client.try_authorize_with_slippage(
+                &pid(&env, 1),
+                &buyer,
+                &recipient,
+                &1000,
+                &1000,
+                &bps
+            ),
+            Err(Ok(Error::InvalidSlippage))
+        );
+    }
+    assert_eq!(client.get_authorization(&pid(&env, 1)), None);
+    assert_eq!(
+        TokenClient::new(&env, &token).allowance(&buyer, &client.address),
+        0
+    );
+}
+
+#[test]
+fn test_slippage_overflow_rejected() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let recipient = Address::generate(&env);
+
+    // i128::MAX with any non-zero tolerance cannot be represented.
+    assert_eq!(
+        client.try_authorize_with_slippage(
+            &pid(&env, 1),
+            &buyer,
+            &recipient,
+            &i128::MAX,
+            &1000,
+            &1
+        ),
+        Err(Ok(Error::AmountOverflow))
+    );
+    // With 0 bps the maximum is the cap itself — no overflow.
+    client.authorize_with_slippage(&pid(&env, 2), &buyer, &recipient, &i128::MAX, &1000, &0);
+}
+
+#[test]
+fn test_slippage_allowance_covers_tolerance() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    client.authorize_with_slippage(&p, &buyer, &recipient, &10_000, &1000, &500);
+    assert_eq!(
+        TokenClient::new(&env, &token).allowance(&buyer, &client.address),
+        10_500
+    );
+    let record = client.get_authorization(&p).unwrap();
+    assert_eq!(record.cap, 10_000);
+    assert_eq!(record.max_slippage_bps, 500);
+}
+
+#[test]
+fn test_authorize_defaults_to_zero_slippage() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    client.authorize(&p, &buyer, &recipient, &1000, &1000);
+    assert_eq!(client.get_authorization(&p).unwrap().max_slippage_bps, 0);
+    assert_eq!(
+        TokenClient::new(&env, &token).allowance(&buyer, &client.address),
+        1000
+    );
+}
+
+#[test]
+fn test_authorize_with_slippage_event() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    client.authorize_with_slippage(&p, &buyer, &recipient, &1000, &1000, &75);
+
+    let expected_data = {
+        let mut m = soroban_sdk::Map::<Symbol, Val>::new(&env);
+        m.set(Symbol::new(&env, "cap"), 1000i128.into_val(&env));
+        m.set(Symbol::new(&env, "expiry"), 1000u32.into_val(&env));
+        m.set(Symbol::new(&env, "from"), buyer.into_val(&env));
+        m.set(Symbol::new(&env, "max_slippage_bps"), 75u32.into_val(&env));
+        m.set(Symbol::new(&env, "to"), recipient.into_val(&env));
+        m.into_val(&env)
+    };
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "authorize_event"), p.clone()).into_val(&env),
+                expected_data
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_max_settleable_extremes() {
+    assert_eq!(max_settleable(0, MAX_SLIPPAGE_BPS), Some(0));
+    assert_eq!(max_settleable(1, MAX_SLIPPAGE_BPS), Some(2));
+    assert_eq!(max_settleable(i128::MAX, 0), Some(i128::MAX));
+    assert_eq!(max_settleable(i128::MAX, 1), None);
+    // Largest cap that still doubles without overflow.
+    let half = i128::MAX / 2;
+    assert_eq!(max_settleable(half, MAX_SLIPPAGE_BPS), Some(half * 2));
+    assert_eq!(max_settleable(half + 1, MAX_SLIPPAGE_BPS), None);
+    // Caps far above i128::MAX / 10_000, where a naive cap * bps overflows.
+    let big = i128::MAX / 3;
+    assert_eq!(max_settleable(big, 5_000), Some(big + big / 2));
+    assert_eq!(max_settleable(-1, 0), None);
+    assert_eq!(max_settleable(1000, MAX_SLIPPAGE_BPS + 1), None);
+}
+
+// ── Domain-separated signatures (issue #416) ────────────────────────────────
+
+fn signing_key(n: u8) -> SigningKey {
+    SigningKey::from_bytes(&[n; 32])
+}
+
+fn pubkey_of(env: &Env, sk: &SigningKey) -> BytesN<32> {
+    BytesN::from_array(env, &sk.verifying_key().to_bytes())
+}
+
+fn sign_digest(env: &Env, sk: &SigningKey, digest: &BytesN<32>) -> BytesN<64> {
+    let sig = sk.sign(&digest.to_array());
+    BytesN::from_array(env, &sig.to_bytes())
+}
+
+/// The domain separator must differ across networks: a signature made on
+/// one network can never produce the same digest on another.
+#[test]
+fn test_domain_separator_changes_with_network() {
+    let (env, client, _admin, _buyer, _seller, _token) = setup();
+    let d1 = client.get_domain_separator();
+
+    env.ledger().set_network_id([9u8; 32]);
+    let d2 = client.get_domain_separator();
+
+    assert_ne!(d1, d2, "domain separator must bind the network id");
+}
+
+/// The digest covers the full authorization tuple: changing any field
+/// changes the digest a signer would have to produce.
+#[test]
+fn test_authorization_digest_binds_every_field() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+
+    let base = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+
+    // Different cap.
+    let other_cap = client.get_authorization_digest(&p, &buyer, &recipient, &999, &1000);
+    // Different expiry.
+    let other_expiry = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &999);
+    // Different payment id.
+    let other_pid =
+        client.get_authorization_digest(&pid(&env, 2), &buyer, &recipient, &1000, &1000);
+    // Different recipient.
+    let other_recipient =
+        client.get_authorization_digest(&p, &buyer, &Address::generate(&env), &1000, &1000);
+
+    assert_ne!(base, other_cap);
+    assert_ne!(base, other_expiry);
+    assert_ne!(base, other_pid);
+    assert_ne!(base, other_recipient);
+}
+
+#[test]
+fn test_register_signer_and_get() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let sk = signing_key(7);
+    let pk = pubkey_of(&env, &sk);
+
+    assert_eq!(client.get_signer(&buyer), None);
+    client.register_signer(&buyer, &pk);
+    assert_eq!(client.get_signer(&buyer), Some(pk));
+}
+
+#[test]
+fn test_authorize_signed_unregistered_signer_fails() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+    let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+    assert_eq!(
+        client.try_authorize_signed(&p, &buyer, &recipient, &1000, &1000, &sig),
+        Err(Ok(Error::SignerNotRegistered))
+    );
+}
+
+/// End-to-end happy path: register the key, sign the domain-separated
+/// digest, authorize — and the regular settle flow still works afterwards.
+#[test]
+fn test_authorize_signed_valid_signature_succeeds() {
+    let (env, client, _admin, buyer, _seller, token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+    let sk = signing_key(7);
+    let pk = pubkey_of(&env, &sk);
+
+    client.register_signer(&buyer, &pk);
+    let digest = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+    let sig = sign_digest(&env, &sk, &digest);
+
+    client.authorize_signed(&p, &buyer, &recipient, &1000, &1000, &sig);
+    let record = client.get_authorization(&p).unwrap();
+    assert_eq!(record.cap, 1000);
+    assert_eq!(record.from, buyer);
+    assert_eq!(record.to, recipient);
+
+    env.ledger().with_mut(|li| li.sequence_number = 50);
+    client.settle(&p, &500);
+    let tc = TokenClient::new(&env, &token);
+    assert_eq!(tc.balance(&recipient), 500);
+}
+
+/// Signatures are network-bound: the *same* signature that verified before
+/// a network switch must be rejected afterwards, because the digest moved
+/// with the domain separator.
+#[test]
+fn test_authorize_signed_rejected_on_different_network() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+    let sk = signing_key(7);
+    let pk = pubkey_of(&env, &sk);
+
+    client.register_signer(&buyer, &pk);
+    let digest_before = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+    let sig = sign_digest(&env, &sk, &digest_before);
+
+    // Simulate the same signed payload arriving on another network.
+    env.ledger().set_network_id([9u8; 32]);
+
+    let digest_after = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+    assert_ne!(digest_before, digest_after, "digest must move with network");
+
+    // ed25519_verify traps on mismatch — the whole call errors out.
+    assert!(client
+        .try_authorize_signed(&p, &buyer, &recipient, &1000, &1000, &sig)
+        .is_err());
+    assert!(
+        client.get_authorization(&p).is_none(),
+        "no authorization may be recorded after a failed verification"
+    );
+}
+
+/// A signature produced by a key other than the registered one is rejected.
+#[test]
+fn test_authorize_signed_rejected_for_wrong_key() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+    let registered = signing_key(7);
+    let attacker = signing_key(8);
+
+    client.register_signer(&buyer, &pubkey_of(&env, &registered));
+    let digest = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+    let sig = sign_digest(&env, &attacker, &digest);
+
+    assert!(client
+        .try_authorize_signed(&p, &buyer, &recipient, &1000, &1000, &sig)
+        .is_err());
+    assert!(client.get_authorization(&p).is_none());
+}
+
+/// The signature binds the exact signed tuple: a valid signature over
+/// `cap = 1000` does not authorize `cap = 999`.
+#[test]
+fn test_authorize_signed_rejected_when_cap_differs() {
+    let (env, client, _admin, buyer, _seller, _token) = setup();
+    let p = pid(&env, 1);
+    let recipient = Address::generate(&env);
+    let sk = signing_key(7);
+
+    client.register_signer(&buyer, &pubkey_of(&env, &sk));
+    let digest = client.get_authorization_digest(&p, &buyer, &recipient, &1000, &1000);
+    let sig = sign_digest(&env, &sk, &digest);
+
+    assert!(client
+        .try_authorize_signed(&p, &buyer, &recipient, &999, &1000, &sig)
+        .is_err());
+    assert!(client.get_authorization(&p).is_none());
 }
