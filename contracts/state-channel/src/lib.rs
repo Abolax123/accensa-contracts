@@ -21,9 +21,9 @@ use accensa_common::{storage::extend_instance_ttl, Error};
 use close::MutualCloseState;
 use multi_asset::{MultiAssetChannel, MultiAssetState};
 use nonce::NonceWindow;
-use soroban_sdk::{xdr::ToXdr, 
-    contract, contractevent, contractimpl, contractmeta, contracttype, Address, Bytes, BytesN, Env,
-    Map,
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contractmeta, contracttype, xdr::ToXdr, Address, Bytes,
+    BytesN, Env, Map,
 };
 
 contractmeta!(key = "name", val = "StateChannel");

@@ -502,8 +502,6 @@ const MAX_BATCH_SIZE: u32 = 100;
 /// call — into the same entry point or a different one — observes the flag
 /// set and is rejected with [`Error::ReentrancyBlocked`] instead of racing
 /// ahead of the pending state update.
-
-
 /// Increment the monotonic nonce and return its *previous* value (issue #136).
 fn increment_nonce(env: &Env) -> u64 {
     let current: u64 = env.storage().instance().get(&DataKey::Nonce).unwrap_or(0);

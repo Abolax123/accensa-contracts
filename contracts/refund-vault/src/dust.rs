@@ -16,9 +16,7 @@
 use accensa_common::Error;
 use soroban_sdk::{contractevent, token, Address, BytesN, Env};
 
-use crate::{
-     active_fee_recipient,  DataKey, RefundRecord,
-};
+use crate::{active_fee_recipient, DataKey, RefundRecord};
 
 /// Default dust threshold in the token's smallest unit (stroops for XLM).
 pub const DEFAULT_DUST_THRESHOLD: i128 = 100;
