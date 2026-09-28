@@ -2,7 +2,7 @@
 
 use accensa_common::Error;
 pub use layerzero::{
-    encode_dispute_payload, parse_dispute_payload, DisputeResolvedEvent, DisputeResolution,
+    encode_dispute_payload, parse_dispute_payload, DisputeResolution, DisputeResolvedEvent,
     PeerAddress,
 };
 pub use outbound::{EvmAddress, OutboundBridgePayload};

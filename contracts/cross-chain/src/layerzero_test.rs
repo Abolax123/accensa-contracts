@@ -18,10 +18,9 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, Event,
 };
 
-
 use crate::{
     layerzero::{
-        encode_dispute_payload, DisputeResolvedEvent, DisputeResolution, PeerAddress,
+        encode_dispute_payload, DisputeResolution, DisputeResolvedEvent, PeerAddress,
         DISPUTE_PAYLOAD_LEN,
     },
     CrossChainBridge, CrossChainBridgeClient,
@@ -124,7 +123,13 @@ fn authorized_endpoint_delivers_dispute_resolution() {
     let dispute_id = s.dispute_id(1);
     let payload = s.payload(&dispute_id, 500);
 
-    let resolution = s.endpoint.deliver(&s.bridge_id, &s.src_eid, &s.peer, &1, &payload);
+    let resolution = s
+        .endpoint
+        .deliver(&s.bridge_id, &s.src_eid, &s.peer, &1, &payload);
+
+    // `events().all()` covers the last invocation only, so capture the
+    // delivery's events before any other contract call.
+    let events = s.env.events().all().filter_by_contract(&s.bridge_id);
 
     assert_eq!(resolution.dispute_id, dispute_id);
     assert_eq!(resolution.approved_amount, 500);
@@ -132,12 +137,12 @@ fn authorized_endpoint_delivers_dispute_resolution() {
     assert_eq!(resolution.peer, s.peer);
     assert_eq!(resolution.settled_at, 1_700_000_000);
 
-    // Delivery state is queryable and the event is published.
+    // Delivery state is queryable and the event was published.
     assert!(s.bridge.is_dispute_settled(&dispute_id));
     assert_eq!(s.bridge.get_peer_nonce(&s.src_eid, &s.peer), 1);
     assert_eq!(
-        s.env.events().all().filter_by_contract(&s.bridge_id),
-        std::vec![DisputeResolvedEvent {
+        events.events(),
+        &[DisputeResolvedEvent {
             dispute_id: dispute_id.clone(),
             resolution_hash: BytesN::from_array(&s.env, &[9u8; 32]),
             approved_amount: 500,
@@ -154,8 +159,13 @@ fn authorized_endpoint_delivers_dispute_resolution() {
 fn later_nonces_are_accepted_and_advance_the_channel() {
     let s = setup();
     let first = s.dispute_id(1);
-    s.endpoint
-        .deliver(&s.bridge_id, &s.src_eid, &s.peer, &1, &s.payload(&first, 100));
+    s.endpoint.deliver(
+        &s.bridge_id,
+        &s.src_eid,
+        &s.peer,
+        &1,
+        &s.payload(&first, 100),
+    );
     let second = s.dispute_id(2);
     s.endpoint.deliver(
         &s.bridge_id,
@@ -186,9 +196,7 @@ fn untrusted_peer_is_rejected() {
         Err(Ok(Error::Unauthorized))
     );
     // Nothing was recorded.
-    assert!(!s
-        .bridge
-        .is_dispute_settled(&s.dispute_id(1)));
+    assert!(!s.bridge.is_dispute_settled(&s.dispute_id(1)));
     assert_eq!(s.bridge.get_peer_nonce(&s.src_eid, &stranger), 0);
 }
 
@@ -275,7 +283,8 @@ fn malformed_payload_is_rejected() {
     let full = s.payload(&s.dispute_id(1), 100);
     let truncated = full.slice(0..(DISPUTE_PAYLOAD_LEN as u32 - 1));
     assert_eq!(
-        s.bridge.try_lz_receive(&s.endpoint_id, &s.src_eid, &s.peer, &1, &truncated),
+        s.bridge
+            .try_lz_receive(&s.endpoint_id, &s.src_eid, &s.peer, &1, &truncated),
         Err(Ok(Error::InvalidProof))
     );
 
@@ -347,10 +356,8 @@ fn admin_gated_configuration_rejects_non_admin() {
     let attacker = Address::generate(&s.env);
 
     assert_eq!(
-        s.bridge.try_set_layerzero_endpoint(
-            &attacker,
-            &Address::generate(&s.env),
-        ),
+        s.bridge
+            .try_set_layerzero_endpoint(&attacker, &Address::generate(&s.env),),
         Err(Ok(Error::Unauthorized))
     );
     assert_eq!(
@@ -369,8 +376,7 @@ fn admin_gated_configuration_rejects_non_admin() {
 fn endpoint_rotation_requires_the_new_endpoint_for_delivery() {
     let s = setup();
     let new_endpoint_id = s.env.register(MockEndpoint, ());
-    s.bridge
-        .set_layerzero_endpoint(&s.admin, &new_endpoint_id);
+    s.bridge.set_layerzero_endpoint(&s.admin, &new_endpoint_id);
     assert_eq!(s.bridge.get_layerzero_endpoint(), new_endpoint_id);
 
     // The old endpoint is no longer accepted...

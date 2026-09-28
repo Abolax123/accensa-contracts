@@ -156,10 +156,17 @@ pub fn parse_dispute_payload(env: &Env, payload: &Bytes) -> Result<DisputeResolu
         return Err(Error::InvalidProof);
     }
 
-    let dispute_id = BytesN::from_array(env, &raw[1..33]);
-    let resolution_hash = BytesN::from_array(env, &raw[33..65]);
+    let mut dispute_bytes = [0u8; 32];
+    dispute_bytes.copy_from_slice(&raw[1..33]);
+    let dispute_id = BytesN::from_array(env, &dispute_bytes);
 
-    let amount_bytes = [raw[65], raw[66], raw[67], raw[68], raw[69], raw[70], raw[71], raw[72]];
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&raw[33..65]);
+    let resolution_hash = BytesN::from_array(env, &hash_bytes);
+
+    let amount_bytes = [
+        raw[65], raw[66], raw[67], raw[68], raw[69], raw[70], raw[71], raw[72],
+    ];
     let approved_amount = u64::from_be_bytes(amount_bytes);
 
     let settled_bytes = [raw[73], raw[74], raw[75], raw[76]];

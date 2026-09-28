@@ -595,14 +595,7 @@ impl Governance {
         report: simulation::SimulationReport,
     ) -> Result<u64, Error> {
         proposer.require_auth();
-        simulation::propose_with_simulation(
-            &env,
-            &proposer,
-            target,
-            function,
-            args,
-            report,
-        )
+        simulation::propose_with_simulation(&env, &proposer, target, function, args, report)
     }
 
     /// Configure proposal simulation (member auth): which simulator contract

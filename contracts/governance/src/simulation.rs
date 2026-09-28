@@ -276,9 +276,7 @@ pub(crate) fn propose_with_simulation(
     // and every existing stored proposal — stays unchanged.
     let report_key = report_key(next_id);
     env.storage().persistent().set(&report_key, &report);
-    env.storage()
-        .persistent()
-        .extend_ttl(&report_key, ttl, ttl);
+    env.storage().persistent().extend_ttl(&report_key, ttl, ttl);
 
     env.storage()
         .instance()
@@ -309,9 +307,8 @@ mod tests {
     use super::*;
     use crate::{Error, Governance, GovernanceClient};
     use soroban_sdk::{
-        contract, contractimpl, symbol_short,
-        testutils::Address as _,
-        Address, Env, IntoVal, Symbol, Val, Vec,
+        contract, contractimpl, symbol_short, testutils::Address as _, Address, Env, IntoVal,
+        Symbol, Val, Vec,
     };
 
     /// Minimal governed target: `set_value` requires the stored admin's
@@ -360,12 +357,7 @@ mod tests {
 
     #[contractimpl]
     impl MockSimulator {
-        pub fn simulate(
-            env: Env,
-            _target: Address,
-            function: Symbol,
-            _args: Vec<Val>,
-        ) -> u32 {
+        pub fn simulate(env: Env, _target: Address, function: Symbol, _args: Vec<Val>) -> u32 {
             if function == Symbol::new(&env, "set_value") {
                 SIM_OK
             } else {
@@ -405,13 +397,15 @@ mod tests {
         // Enable mandatory simulation: any member may configure it.
         gov.set_simulation_config(&m1, &Some(simulator.clone()), &true);
 
+        let simulator_client = MockSimulatorClient::new(&env, &simulator);
+
         Harness {
             env,
             gov,
             gov_id,
             target: target_id,
             simulator,
-            simulator_client: MockSimulatorClient::new(&env, &simulator),
+            simulator_client,
             m1,
             m2,
         }
@@ -506,13 +500,8 @@ mod tests {
         // the recomputed binding hash no longer matches.
         let tampered_args = set_value_args(&h.env, 8);
         assert_eq!(
-            h.gov.try_propose_with_simulation(
-                &h.m1,
-                &h.target,
-                &function,
-                &tampered_args,
-                &report,
-            ),
+            h.gov
+                .try_propose_with_simulation(&h.m1, &h.target, &function, &tampered_args, &report,),
             Err(Ok(Error::SimulationMismatch))
         );
 
@@ -524,7 +513,8 @@ mod tests {
             sim_hash: sim_hash(&h.env, &h.gov_id, 2, &h.target, &function, &args),
         };
         assert_eq!(
-            h.gov.try_propose_with_simulation(&h.m1, &h.target, &function, &args, &stale),
+            h.gov
+                .try_propose_with_simulation(&h.m1, &h.target, &function, &args, &stale),
             Err(Ok(Error::SimulationMismatch))
         );
     }
@@ -539,7 +529,8 @@ mod tests {
         // An impostor simulator, correctly bound but not the registered one.
         report.simulator = Address::generate(&h.env);
         assert_eq!(
-            h.gov.try_propose_with_simulation(&h.m1, &h.target, &function, &args, &report),
+            h.gov
+                .try_propose_with_simulation(&h.m1, &h.target, &function, &args, &report),
             Err(Ok(Error::SimulationMismatch))
         );
     }

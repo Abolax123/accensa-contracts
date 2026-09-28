@@ -6,7 +6,7 @@ use super::*;
 use crate::hashlock::HashlockPaymentState;
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
     Address, Bytes, BytesN, Env, Event,
 };
@@ -80,9 +80,7 @@ fn valid_reveal_credits_receiver_balance() {
     assert_eq!(channel.balance, 300);
     assert_eq!(client.get_hashlock_reserved(&channel_id), 0);
     assert_eq!(
-        client
-            .get_hashlock_payment(&channel_id, &payment_id)
-            .state,
+        client.get_hashlock_payment(&channel_id, &payment_id).state,
         HashlockPaymentState::Resolved
     );
     // No tokens moved out of escrow: the receiver's entitlement grew by
@@ -98,7 +96,7 @@ fn valid_reveal_credits_receiver_balance() {
 #[test]
 fn reveal_event_carries_the_hashlock_not_the_secret() {
     let (env, client, _token, sender, receiver) = setup();
-    let contract = client.address;
+    let contract = client.address.clone();
     let channel_id = client.open_channel(&sender, &receiver, &pk(&env), &DEPOSIT, &720);
     let payment_id = client.add_hashlock_payment(&channel_id, &hash(&env, b"secret"), &300);
 
@@ -130,9 +128,7 @@ fn invalid_reveal_is_rejected_and_payment_stays_pending() {
     );
     // Nothing changed: still pending, still reserved, receiver not credited.
     assert_eq!(
-        client
-            .get_hashlock_payment(&channel_id, &payment_id)
-            .state,
+        client.get_hashlock_payment(&channel_id, &payment_id).state,
         HashlockPaymentState::Pending
     );
     assert_eq!(client.get_hashlock_reserved(&channel_id), 100);
@@ -303,7 +299,10 @@ fn close_with_preimage_settles_the_invoice_without_waiting() {
     assert_eq!(TokenClient::new(&env, &token).balance(&receiver), 650);
     assert_eq!(TokenClient::new(&env, &token).balance(&sender), 0);
     assert_eq!(TokenClient::new(&env, &token).balance(&client.address), 350);
-    assert_eq!(client.get_channel(&channel_id).phase, ChannelPhase::Finalized);
+    assert_eq!(
+        client.get_channel(&channel_id).phase,
+        ChannelPhase::Finalized
+    );
 }
 
 #[test]
