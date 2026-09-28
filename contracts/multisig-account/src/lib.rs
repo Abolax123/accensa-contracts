@@ -20,8 +20,8 @@
 
 #![no_std]
 
-mod timelock;
 mod signers;
+mod timelock;
 
 // The helpers are only needed by tests; gate them so the contract itself stays
 // minimal. Unit tests within this crate (`#[cfg(test)]`) and downstream
@@ -132,7 +132,7 @@ impl MultisigAccount {
     /// Execute a batch of transactions
     pub fn execute_batch(env: Env, calls: Vec<Call>) -> Vec<soroban_sdk::Val> {
         env.current_contract_address().require_auth();
-        
+
         let mut results = Vec::new(&env);
         for call in calls.iter() {
             let res = env.invoke_contract(&call.contract, &call.function, call.args);
