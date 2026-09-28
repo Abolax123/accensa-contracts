@@ -9,15 +9,15 @@ breaking changes bump the **minor** version, and they are called out as such.
 ## [Unreleased]
 
 ### Added
-- **`reputation` (issue #450): soulbound tokens for verified merchants.** New
-  `sbt` module mints non-transferable KYC / volume-tier credentials
-  (`Verified` / `Trusted` / `Premium`) bound to one address each, issued and
-  governed by the contract authority (`issue` / `revoke` / `slash`).
-  `transfer` and `approve` exist only to revert with typed errors
-  (`SbtNonTransferable` / `SbtApprovalDisabled`), so a credential can never
-  be bought, borrowed or farmed; a revoke burns the credential and writes a
-  permanent tombstone that blocks re-issue, while a slash flags it in place
-  as a public record.
+- **`reputation` (issue #452): on-chain credit scoring for buyers.** New
+  `credit_score` module maintains a dynamic 0–1000 score per buyer: the
+  escrow authority records successful completions (growth of 25% of the
+  remaining headroom per completion, `record_completion` with replay-protected
+  escrow ids) and fraudulent dispute losses (a 50%-of-current-score penalty,
+  `record_fraud`); scores decay 1% of the headroom above a floor of 100 per
+  ~10 days of inactivity and start neutral at 500. `get_score` is read-only,
+  and zero-fee tiers unlock by score (half fee at the gold cut-off, zero at
+  `zero_fee_tier`, both re-tunable by the authority via `set_score_config`).
 - **`reputation` (issue #451): tiered NFT dispute-resolution badges for
   arbitrators.** New `accensa-reputation` contract tracks each arbitrator's
   lifetime accurate dispute resolutions — recorded only by the arbiter
