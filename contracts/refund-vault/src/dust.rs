@@ -17,7 +17,7 @@ use accensa_common::Error;
 use soroban_sdk::{contractevent, token, Address, BytesN, Env};
 
 use crate::{
-    acquire_reentrancy_lock, active_fee_recipient, release_reentrancy_lock, DataKey, RefundRecord,
+     active_fee_recipient,  DataKey, RefundRecord,
 };
 
 /// Default dust threshold in the token's smallest unit (stroops for XLM).
@@ -90,7 +90,7 @@ fn closed_at(record: &RefundRecord, window: u32) -> u32 {
 }
 
 pub(crate) fn sweep_dust(env: &Env, payment_ref: BytesN<32>) -> Result<i128, Error> {
-    acquire_reentrancy_lock(env)?;
+    accensa_common::reentrancy::ReentrancyGuard::acquire(env)?;
 
     if env
         .storage()
@@ -153,6 +153,6 @@ pub(crate) fn sweep_dust(env: &Env, payment_ref: BytesN<32>) -> Result<i128, Err
     }
     .publish(env);
 
-    release_reentrancy_lock(env);
+    accensa_common::reentrancy::ReentrancyGuard::release(env);
     Ok(residual)
 }

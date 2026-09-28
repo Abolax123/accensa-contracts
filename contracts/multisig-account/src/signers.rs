@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-use soroban_sdk::{contractevent, Address, Env, Vec};
-
-use crate::Error;
-=======
 //! Dynamic threshold rotation for multisig-account signers.
 //!
 //! Supports atomic multi-signer threshold reconfiguration in a single call
@@ -31,25 +26,12 @@ const ZERO_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     *addr == Address::from_str(env, ZERO_ACCOUNT) || *addr == Address::from_str(env, ZERO_CONTRACT)
 }
->>>>>>> origin/main
 
-/// Dynamic threshold rotation for multisig-account signers.
-///
-/// Supports atomic multi-signer threshold reconfiguration in a single call
-/// to avoid intermediate insecure states when replacing signers.
-///
-/// Validates invariant: 1 <= new_threshold <= total_active_signers.
-/// Prevents duplicate public keys and zeroed addresses.
-/// Emits SignersRotated audit event.
-///
 /// Rotate signers and threshold atomically in a single call.
 ///
-<<<<<<< HEAD
-=======
 /// Requires the account's own authorization, i.e. `threshold` of the
 /// *current* signers must approve the rotation.
 ///
->>>>>>> origin/main
 /// # Parameters
 /// - `to_add`: new signers to add (must not already be signers)
 /// - `to_remove`: signers to remove (must be existing signers)
@@ -76,31 +58,6 @@ pub fn rotate_signers_and_threshold(
     // Check for duplicate addresses in to_add
     let mut seen_in_add = Vec::<Address>::new(env);
     for addr in to_add.iter() {
-<<<<<<< HEAD
-        // Check for duplicates within to_add
-        if seen_in_add.iter().any(|a| a == addr) {
-            return Err(Error::InsufficientSignatures);
-        }
-        seen_in_add.push_back(addr.clone());
-    }
-
-    // Check for duplicate addresses between to_add and to_remove
-    for addr in to_remove.iter() {
-        if seen_in_add.iter().any(|a| a == addr) {
-            return Err(Error::InsufficientSignatures); // can't both add and remove same address
-        }
-    }
-
-    // Zero address validation: Soroban zero address is "X:" (all zeros).
-    // Validate that to_add and to_remove don't contain zero addresses.
-    for addr in to_add.iter() {
-        if addr.to_string() == soroban_sdk::String::from_str(env, "X:") {
-            return Err(Error::InsufficientSignatures);
-        }
-    }
-    for addr in to_remove.iter() {
-        if addr.to_string() == soroban_sdk::String::from_str(env, "X:") {
-=======
         if seen_in_add.contains(&addr) {
             return Err(Error::InsufficientSignatures);
         }
@@ -110,7 +67,6 @@ pub fn rotate_signers_and_threshold(
     // Can't both add and remove the same address
     for addr in to_remove.iter() {
         if seen_in_add.contains(&addr) {
->>>>>>> origin/main
             return Err(Error::InsufficientSignatures);
         }
     }
@@ -205,8 +161,6 @@ pub struct SignersRotated {
     pub added: Vec<Address>,
     pub removed: Vec<Address>,
 }
-<<<<<<< HEAD
-=======
 
 #[cfg(test)]
 mod tests {
@@ -261,4 +215,3 @@ mod tests {
         client.rotate_signers_and_threshold(&vec![&env, a], &vec![&env], &1);
     }
 }
->>>>>>> origin/main

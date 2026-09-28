@@ -21,7 +21,7 @@ use accensa_common::{storage::extend_instance_ttl, Error};
 use close::MutualCloseState;
 use multi_asset::{MultiAssetChannel, MultiAssetState};
 use nonce::NonceWindow;
-use soroban_sdk::{
+use soroban_sdk::{xdr::ToXdr, 
     contract, contractevent, contractimpl, contractmeta, contracttype, Address, Bytes, BytesN, Env,
     Map,
 };
@@ -643,6 +643,7 @@ impl StateChannel {
     /// the receiver gets `channel.balance` and the sender is refunded
     /// `amount - balance`; nothing is minted or withheld.
     pub fn finalize_dispute(env: Env, channel_id: u64) -> Result<(), Error> {
+        accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
         let mut channel = Self::get_channel_internal(&env, channel_id)?;
 
         if channel.phase != ChannelPhase::Disputed {
@@ -692,11 +693,13 @@ impl StateChannel {
         }
         .publish(&env);
 
+        accensa_common::reentrancy::ReentrancyGuard::release(&env);
         Ok(())
     }
 
     /// Claim funds after the dispute window has expired.
     pub fn claim(env: Env, channel_id: u64) -> Result<(), Error> {
+        accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
         let mut channel = Self::get_channel_internal(&env, channel_id)?;
 
         if channel.phase != ChannelPhase::Closed {
@@ -739,11 +742,13 @@ impl StateChannel {
         }
         .publish(&env);
 
+        accensa_common::reentrancy::ReentrancyGuard::release(&env);
         Ok(())
     }
 
     /// Reclaim escrowed funds for an expired channel.
     pub fn reclaim(env: Env, channel_id: u64) -> Result<(), Error> {
+        accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
         let mut channel = Self::get_channel_internal(&env, channel_id)?;
 
         if channel.phase != ChannelPhase::Open {
@@ -784,6 +789,7 @@ impl StateChannel {
             );
         }
 
+        accensa_common::reentrancy::ReentrancyGuard::release(&env);
         Ok(())
     }
 
@@ -909,7 +915,12 @@ impl StateChannel {
 
     /// Settle every asset of a multi-asset channel in one atomic call.
     pub fn settle_multi_asset_channel(env: Env, channel_id: u64) -> Result<(), Error> {
-        multi_asset::settle(&env, channel_id)
+        accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
+        let res = multi_asset::settle(&env, channel_id);
+        if res.is_ok() {
+            accensa_common::reentrancy::ReentrancyGuard::release(&env);
+        }
+        res
     }
 
     /// Read a multi-asset channel record.
@@ -948,7 +959,12 @@ impl StateChannel {
     /// Refund a timed-out hop back to the sender's free escrow.
     /// Permissionless once `timeout_ledger` has passed. See [`htlc`].
     pub fn refund_htlc(env: Env, channel_id: u64, htlc_id: u64) -> Result<(), Error> {
-        htlc::refund(&env, channel_id, htlc_id)
+        accensa_common::reentrancy::ReentrancyGuard::acquire(&env)?;
+        let res = htlc::refund(&env, channel_id, htlc_id);
+        if res.is_ok() {
+            accensa_common::reentrancy::ReentrancyGuard::release(&env);
+        }
+        res
     }
 
     /// Read a single HTLC hop.
@@ -1083,18 +1099,28 @@ impl StateChannel {
         env: Env,
         channel_id: u64,
         commitment: BytesN<32>,
-        proof: BytesN<32>,
+        value: i128,
+        blinding_factor: BytesN<32>,
     ) -> Result<(), Error> {
         let channel = Self::get_channel_internal(&env, channel_id)?;
         if channel.phase != ChannelPhase::Open && channel.phase != ChannelPhase::Disputed {
             return Err(Error::ChannelNotOpen);
         }
 
-        // ZK Verification logic simulation for off-chain settlement
-        // In a real scenario, this would verify the proof against the commitment.
-        let expected_hash = env.crypto().sha256(&proof.into());
+        // Proper cryptographic commitment verification
+        // C = H(value || blinding_factor)
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&value.to_xdr(&env));
+        payload.append(&blinding_factor.into());
+        let expected_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
         if expected_hash != commitment {
             return Err(Error::InvalidSignature);
+        }
+
+        // Range proof checks: ensure the value is within a valid range
+        if value < 0 || value > channel.balance {
+            return Err(Error::InvalidAmount);
         }
 
         Ok(())
