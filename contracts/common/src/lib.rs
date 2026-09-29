@@ -176,11 +176,19 @@ pub enum Error {
     /// The strategy still holds deployed principal, so it cannot be replaced
     /// or revoked yet (issue #415).
     StrategyHasPrincipal = 323,
-    /// No verified randomness seed is recorded for this VDF id (issue #429).
-    RandomnessNotFound = 324,
-    /// Rejected fee ladder: empty, over the vault's `MAX_TIERS`, not starting
-    /// at `0`, not strictly increasing, or a fee above `10_000` bps.
-    InvalidTierLadder = 325,
+    /// No escrow record exists for the NFT contract/token id (issue #474).
+    NftEscrowNotFound = 324,
+    /// The NFT contract/token id is already escrowed in this vault
+    /// (issue #474).
+    NftAlreadyEscrowed = 325,
+    /// The vault is not the current owner of the NFT it was asked to release
+    /// (issue #474).
+    NftNotOwned = 326,
+    /// No dispute is recorded under the given id in the fallback-oracle
+    /// ledger (issue #469).
+    DisputeNotFound = 327,
+    /// A fallback-oracle dispute was already settled (issue #469).
+    DisputeClosed = 328,
     /// Explicit Soroban Host error mapping (issue #380).
     HostError = 500,
 }
