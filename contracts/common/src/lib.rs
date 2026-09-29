@@ -144,6 +144,22 @@ pub enum Error {
     /// A multi-asset state names a token the channel does not escrow, or omits
     /// one it does (issue #423).
     UnsupportedAsset = 409,
+    /// The referenced HTLC does not exist on the channel (issue #458).
+    HtlcNotFound = 410,
+    /// The HTLC is no longer pending (already resolved or refunded).
+    HtlcNotPending = 411,
+    /// The HTLC's timeout ledger has not yet passed, so it cannot be refunded.
+    HtlcNotExpired = 412,
+    /// The supplied preimage does not hash to the HTLC's hash lock.
+    InvalidPreimage = 413,
+    /// A downstream HTLC's timeout must be strictly smaller than its
+    /// upstream parent's (issue #458).
+    HtlcTimeoutOutOfOrder = 414,
+    /// The HTLC would reserve more than the channel's uncommitted escrow.
+    HtlcInsufficientEscrow = 415,
+    /// The HTLC's timeout ledger is already in the past, so it could never be
+    /// resolved before a refund (issue #458).
+    HtlcTimeoutElapsed = 416,
     /// A time/VDF policy gate is active but its policy contract was never
     /// wired (issue #129).
     PolicyContractsNotConfigured = 317,
@@ -273,4 +289,7 @@ pub mod events;
 pub mod keys;
 pub mod math;
 pub mod nonce;
+pub mod reentrancy;
 pub mod storage;
+#[cfg(any(feature = "telemetry", test))]
+pub mod telemetry;
