@@ -9,36 +9,46 @@ breaking changes bump the **minor** version, and they are called out as such.
 ## [Unreleased]
 
 ### Added
-- **`refund-policy-vdf` (issue #429): verifiable randomness from verified VDF
-  output.** New `vrf` module turns a verified Wesolowski proof into a 256-bit
-  randomness seed. `generate_randomness(vdf_id, delay, proof)` verifies the
-  proof against `challenge = sha256(vdf_id)`, derives the seed as
-  `sha256(output || vdf_id || delay)`, records it (persistent storage, TTL
-  extended) under `DataKey::Randomness(vdf_id)`, and emits
-  `RandomnessGenerated`. Derivation is deterministic and idempotent — the first
-  verified proof wins, so a consumer cannot be re-targeted — and the read paths
-  (`get_verified_randomness`, `has_randomness`, `get_randomness_record`) return
-  `Error::RandomnessNotFound` (324) until a seed has been recorded.
-- **`common` (issue #430): type-safe storage-key namespace partitioning.** New
-  `keys` module gives every contract a disjoint, compile-time-checked slice of
-  the storage key space: `KeyNamespace` partitions the `u64` key space into
-  `Vault` / `Admin` / `Auth` / `Oracle` / `Yield` blocks, `DataKey` tags each
-  module-local key with its owning namespace, and `DataKey::discriminant` folds
-  the two into one `u64`. `discriminants_are_distinct` is asserted in a
-  `const _` initializer, so two keys that alias the same `u64` fail `cargo
-  check` rather than silently sharing ledger entries after an upgrade.
-- **`refund-vault`: merchant fee tiers with volume-based promotion.** New
-  `tiers` module lets a merchant install a ladder of `MerchantTier` rungs
-  (`min_settled` volume → `fee_bps`). Every successful refund accrues its gross
-  amount into the merchant's settled volume; crossing a rung promotes the
-  merchant and emits `MerchantTierPromoted`, and the lower fee applies from the
-  next claim on (a claim is charged the tier it entered with, so a batch never
-  mixes rates). The ladder is optional and additive: without one the flat
-  `set_fee_bps` rate applies exactly as before, and `effective_fee_bps` is the
-  single resolution point shared by the claim path and `preview_settlement`.
-  A malformed ladder — empty, longer than `MAX_TIERS`, not starting at `0`, not
-  strictly increasing, or with a fee above `10_000` bps — is rejected with
-  `Error::InvalidTierLadder` (325).
+- **`cross-chain` (issue #455): LayerZero omnichain dispute bridging.** New
+  `layerzero` module lets decentralized arbitrators on remote chains deliver
+  dispute resolutions to Soroban through a LayerZero endpoint. The admin
+  registers the endpoint (`set_layerzero_endpoint`) and trusted peer
+  contracts per source chain (`set_trusted_peer`); the endpoint delivers
+  packets with `lz_receive(src_eid, sender, nonce, payload)`, which validates
+  the sender against the trusted-peer registry, enforces strictly-advancing
+  per-channel packet nonces (replays rejected with `StaleState`),
+  bounds-checks the versioned dispute payload (`parse_dispute_payload`),
+  refuses a dispute id that already settled (`AlreadyRefunded`), and emits
+  `DisputeResolvedEvent`. A mock-endpoint integration suite proves the real
+  auth path: only the registered endpoint calling in can pass
+  `require_auth`.
+- **`state-channel` (issue #488): Lightning-style pre-image reveal
+  mechanics.** New `hashlock` module locks a slice of a channel's free
+  escrow against `sha256(preimage)` (`add_hashlock_payment`) and settles it
+  when the preimage is revealed on-chain (`reveal_preimage`, permissionless,
+  `InvalidPreimage` on mismatch, `HtlcNotPending` on double reveal),
+  crediting the receiver's balance and emitting
+  `HashlockPaymentRevealedEvent` carrying the hashlock — never the secret.
+  `close_channel_with_preimage` ties the reveal into the close flow: the
+  sender's signed final state plus the receiver's preimage settle the
+  invoice atomically, with the receiver's payout becoming
+  `balance + amount` before the challenge window starts. Hashlock
+  reservations share the escrow ceiling with HTLC reservations
+  (`get_reserved_escrow`), so no combination of states, hops and invoices
+  can overdraw escrow.
+- **`governance` (issue #483): proposal simulation hooks.** Proposals can
+  carry a `SimulationReport` from a registered simulator contract
+  (`ProposalSimulator::simulate` dry-runs the exact calldata off-chain, the
+  on-chain side cannot): `propose_with_simulation` verifies the report's
+  simulator is the registered one (its `require_auth` co-signs the
+  creation), that `sim_hash` re-derives to the canonical
+  `sim_payload` binding this proposal id and this exact calldata, and that
+  the outcome is `SIM_OK` — a proposal the dry-run says would revert is
+  rejected at creation (`SimulationFailed`) and never reaches a vote.
+  `set_simulation_config` turns mandatory simulation on/off per body; when
+  mandatory, the plain `propose` path fails with `SimulationRequired`.
+  Reports are stored under their own key (`get_simulation_report`) so the
+  `Proposal` record shape is unchanged.
 - **`reputation` (issue #450): soulbound tokens for verified merchants.** New
   `sbt` module mints non-transferable KYC / volume-tier credentials
   (`Verified` / `Trusted` / `Premium`) bound to one address each, issued and
