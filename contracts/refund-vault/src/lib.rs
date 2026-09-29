@@ -38,7 +38,12 @@ pub struct RefundParam {
     pub vdf_proof: Option<BytesN<256>>,
 }
 
-#[contracttype]
+// `export = false`: the vault's storage keys are internal. No entry point takes
+// or returns one, so publishing them would only inflate the wasm — and the
+// contract-spec text is embedded in the wasm, which is capped at Stellar's
+// 128 KiB contract-code limit. The live layout is documented in
+// `docs/storage-audit.md`.
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     /// Per-instance domain separator (issue #136): `sha256(contract_address)`,
@@ -158,6 +163,15 @@ pub enum DataKey {
     /// rebate pool (issue #415). Falls back to the merchant when unset.
     /// Persistent.
     YieldRecipient,
+    /// The merchant's fee ladder: a strictly increasing `Vec<MerchantTier>`.
+    /// Instance storage. Absent until the merchant installs one, in which case
+    /// the flat [`DataKey::FeeBps`] rate applies unchanged.
+    TierLadder,
+    /// The merchant's cached position on the fee ladder. Instance storage;
+    /// mirrors the active rung's fee and the next promotion threshold so the
+    /// claim hot path reads one small value instead of decoding the whole
+    /// ladder on every claim. See `tiers`.
+    TierState,
 }
 
 #[contracttype]
@@ -473,6 +487,8 @@ pub mod settlement;
 pub mod strategy;
 pub use strategy::{YieldStrategy, YieldStrategyClient};
 
+pub mod tiers;
+
 /// Approximately 30 days of ledgers, assuming ~5 seconds per ledger.
 /// 60 * 60 * 24 * 30 / 5 = 518,400.
 /// This ensures refund records survive long-term audit use before requiring a TTL bump or restoration.
@@ -645,6 +661,10 @@ struct PolicyCache {
     vdf_policy_contract: Option<Address>,
     token_addr: Address,
     fee_bps: u32,
+    /// Whether a merchant fee ladder is installed. When `false` the claim path
+    /// skips tier bookkeeping entirely, so a vault with no ladder pays nothing
+    /// per claim for the tier feature.
+    tiers_active: bool,
 }
 
 /// Read all policy-level instance-storage keys once and return a
@@ -656,6 +676,21 @@ struct PolicyCache {
 /// their use sites, so `PolicyContractsNotConfigured` is still raised only
 /// when the corresponding gate is actually active.
 fn read_policy_cache(env: &Env) -> PolicyCache {
+    // Resolve the merchant fee ladder once. The effective fee and the
+    // "is a ladder installed?" flag come from the same tier-state read, so a
+    // vault without tiers pays one instance load per entry point — and nothing
+    // per claim, since `claim_single` skips tier bookkeeping when there is no
+    // ladder. With no ladder the flat `FeeBps` config applies, exactly as
+    // before. Sharing the resolved fee across a batch also makes promotion
+    // deterministic within a call: a rung crossed by claim N takes effect from
+    // claim N+1 on.
+    let tier_state = tiers::state(env);
+    let fee_bps = match &tier_state {
+        Some(state) => state.fee_bps,
+        None => env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+    };
+    let tiers_active = tier_state.is_some();
+
     PolicyCache {
         refund_window: env
             .storage()
@@ -676,7 +711,8 @@ fn read_policy_cache(env: &Env) -> PolicyCache {
             .unwrap_or(0),
         vdf_policy_contract: env.storage().instance().get(&DataKey::VdfPolicyContract),
         token_addr: env.storage().instance().get(&DataKey::Token).unwrap(),
-        fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+        fee_bps,
+        tiers_active,
     }
 }
 
@@ -898,6 +934,15 @@ fn claim_single(env: &Env, cache: &PolicyCache, claim: &RefundClaim) -> Result<(
         nonce,
     }
     .publish(env);
+
+    // Merchant tier promotion: accrue the gross volume this claim settled and
+    // promote the merchant if it crossed the next rung. This runs only after
+    // the transfers and record write succeeded, so a claim that fails any gate
+    // above never counts toward a promotion. Skipped entirely when the vault
+    // has no ladder, so an untiered vault pays nothing extra per claim.
+    if cache.tiers_active {
+        tiers::on_settled(env, claim.amount);
+    }
 
     Ok(())
 }
@@ -1126,22 +1171,15 @@ impl RefundVault {
 
     /// Refund part (or all) of an original payment.
     ///
-    /// `payment_amount` is the original payment amount and therefore the hard
-    /// ceiling: cumulative refunds for a payment may never exceed it. It is
-    /// supplied by the merchant on **every** call, mirroring how `paid_at_ledger`
-    /// is supplied, so the ceiling never depends on partial bookkeeping. The
-    /// refund window is evaluated against `paid_at_ledger` (the original
-    /// payment), not against a previous partial — each partial does not extend
-    /// the window for the next.
+    /// `payment_amount` is the original amount and therefore the hard ceiling
+    /// on cumulative refunds; like `paid_at_ledger` it is supplied on every
+    /// call, so the ceiling never depends on partial bookkeeping. The window is
+    /// evaluated against `paid_at_ledger`, so a partial never extends it. Thin
+    /// wrapper around the same claim path as [`RefundVault::claim_batch`].
     ///
-    /// This is a thin wrapper around the same shared claim path as
-    /// [`RefundVault::claim_batch`].
-    ///
-    /// Storage note (#99): the layout changed from a single `amount` record to a
-    /// cumulative record under a new `RefundV2` key. A `Refund` key written by
-    /// the legacy single-refund rule still denotes a fully-refunded payment and
-    /// is rejected with [`Error::ExceedsPayment`] rather than a silent
-    /// misinterpretation.
+    /// Storage note (#99): a legacy single-refund `Refund` key still denotes a
+    /// fully-refunded payment and is rejected with [`Error::ExceedsPayment`]
+    /// rather than misread.
     pub fn refund(
         env: Env,
         payment_ref: BytesN<32>,
@@ -1189,28 +1227,15 @@ impl RefundVault {
 
     /// Refund multiple claims in a single transaction.
     ///
-    /// Every element of `claims` is processed in order with exactly the same
-    /// logic as a [`RefundVault::refund`] call — validations, ceilings, fees,
-    /// the float check, cumulative-record storage, TTL extension and a
-    /// [`RefundEvent`] per element — so the whole batch shares one merchant
-    /// authorization and one reentrancy-lock acquisition. Unrelated
-    /// `payment_ref`s are independent; repeated refs accumulate against the
-    /// same ceiling across elements.
+    /// Each element is processed in order with exactly the same logic as
+    /// [`RefundVault::refund`], so the batch shares one merchant authorization
+    /// and one reentrancy lock; unrelated refs are independent, and repeated
+    /// refs accumulate against the same ceiling. The float is re-read per
+    /// element, so a batch cannot overdraw the vault more than the equivalent
+    /// sequence of single refunds.
     ///
-    /// The float is read afresh from the token contract before every element,
-    /// so a batch can never overdraw the vault any more than an equivalent
-    /// sequence of single refunds, and `paid_at_ledger` / `payment_amount` are
-    /// evaluated per claim.
-    ///
-    /// # Atomicity
-    ///
-    /// If any element fails, the call returns that error. A contract error
-    /// reverts the entire Soroban invocation — including the token transfers,
-    /// storage writes and events of the claims that already succeeded within
-    /// this call — so the batch is all-or-nothing: either every claim
-    /// persists, or none of them do.
-    ///
-    /// An empty `claims` vector succeeds as a no-op.
+    /// Atomic: a failing element's error reverts the whole invocation, token
+    /// transfers and events included. An empty `claims` vector is a no-op.
     pub fn claim_batch(env: Env, claims: Vec<RefundClaim>, nonce: u64) -> Result<(), Error> {
         if claims.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
@@ -2611,6 +2636,8 @@ mod strategy_tests;
 mod test;
 #[cfg(test)]
 mod test_helpers;
+#[cfg(test)]
+mod tier_tests;
 mod token_agnostic_tests;
 mod yield_tests;
 
