@@ -45,7 +45,7 @@ pub const LOCAL_MASK: u64 = 0xffff_ffff;
 /// reordered: a persisted key encodes its namespace *by position*, so moving
 /// a variant reinterprets existing ledger entries. New namespaces are
 /// appended.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyNamespace {
     /// Vault-owned operational state (token, windows, fees, locks).
@@ -79,7 +79,7 @@ impl KeyNamespace {
 ///
 /// Only the variant *order* is persisted; renaming a variant is safe, moving
 /// one is not.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VaultKey {
     Token,
@@ -98,7 +98,7 @@ pub enum VaultKey {
 }
 
 /// Admin/ownership keys within [`KeyNamespace::Admin`].
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminKey {
     Admin,
@@ -106,7 +106,7 @@ pub enum AdminKey {
 }
 
 /// Authentication keys within [`KeyNamespace::Auth`].
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthKey {
     DomainSeparator,
@@ -114,7 +114,7 @@ pub enum AuthKey {
 }
 
 /// Oracle keys within [`KeyNamespace::Oracle`].
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OracleKey {
     Whitelist,
@@ -122,7 +122,7 @@ pub enum OracleKey {
 }
 
 /// Yield keys within [`KeyNamespace::Yield`].
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum YieldKey {
     Strategy,
@@ -139,7 +139,7 @@ pub enum YieldKey {
 /// Values that need a per-record dimension (a payment ref, a user address, ...)
 /// are stored inside the concrete module rather than here; this enum is the
 /// stable, collision-free *prefix* every module keys off.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Vault(VaultKey),
@@ -304,8 +304,14 @@ mod tests {
             DataKey::Vault(VaultKey::FeeBps).namespace(),
             KeyNamespace::Vault
         );
-        assert_eq!(DataKey::Admin(AdminKey::Admin).namespace(), KeyNamespace::Admin);
-        assert_eq!(DataKey::Auth(AuthKey::Nonce).namespace(), KeyNamespace::Auth);
+        assert_eq!(
+            DataKey::Admin(AdminKey::Admin).namespace(),
+            KeyNamespace::Admin
+        );
+        assert_eq!(
+            DataKey::Auth(AuthKey::Nonce).namespace(),
+            KeyNamespace::Auth
+        );
         assert_eq!(
             DataKey::Oracle(OracleKey::Policy).namespace(),
             KeyNamespace::Oracle

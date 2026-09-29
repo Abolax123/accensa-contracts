@@ -127,8 +127,15 @@ fn crossing_a_threshold_promotes_and_lowers_the_fee() {
     assert_eq!(ctx.client.get_effective_fee_bps(), 500);
 
     let buyer = Address::generate(&ctx.env);
-    ctx.client
-        .refund(&payment_ref(&ctx, 1), &buyer, &100_000, &0, &1_000_000, &None, &0);
+    ctx.client.refund(
+        &payment_ref(&ctx, 1),
+        &buyer,
+        &100_000,
+        &0,
+        &1_000_000,
+        &None,
+        &0,
+    );
 
     let state = ctx.client.get_tier_state().unwrap();
     assert_eq!(state.current_tier, 1);
@@ -151,8 +158,15 @@ fn the_promoting_claim_still_pays_the_old_tier_fee() {
     ctx.client.set_fee_recipient(&fee_recipient);
 
     let buyer = Address::generate(&ctx.env);
-    ctx.client
-        .refund(&payment_ref(&ctx, 2), &buyer, &100_000, &0, &1_000_000, &None, &0);
+    ctx.client.refund(
+        &payment_ref(&ctx, 2),
+        &buyer,
+        &100_000,
+        &0,
+        &1_000_000,
+        &None,
+        &0,
+    );
     assert_eq!(
         balance(&ctx, &fee_recipient),
         5_000,
@@ -160,8 +174,15 @@ fn the_promoting_claim_still_pays_the_old_tier_fee() {
     );
 
     // From the next claim the promoted tier's 100 bps applies.
-    ctx.client
-        .refund(&payment_ref(&ctx, 3), &buyer, &100_000, &0, &1_000_000, &None, &1);
+    ctx.client.refund(
+        &payment_ref(&ctx, 3),
+        &buyer,
+        &100_000,
+        &0,
+        &1_000_000,
+        &None,
+        &1,
+    );
     assert_eq!(balance(&ctx, &fee_recipient), 5_000 + 1_000);
 }
 
@@ -172,11 +193,23 @@ fn promotion_emits_an_event() {
         .set_tier_ladder(&ladder(&ctx, &[(0, 500), (50_000, 100)]));
 
     let buyer = Address::generate(&ctx.env);
-    ctx.client
-        .refund(&payment_ref(&ctx, 4), &buyer, &50_000, &0, &1_000_000, &None, &0);
+    ctx.client.refund(
+        &payment_ref(&ctx, 4),
+        &buyer,
+        &50_000,
+        &0,
+        &1_000_000,
+        &None,
+        &0,
+    );
 
     assert!(
-        !ctx.env.events().all().is_empty(),
+        !ctx.env
+            .events()
+            .all()
+            .filter_by_contract(&ctx.client.address)
+            .events()
+            .is_empty(),
         "MerchantTierPromoted must be published"
     );
 }
@@ -199,8 +232,15 @@ fn re_installing_a_ladder_preserves_settled_volume() {
     ctx.client.set_tier_ladder(&ladder(&ctx, &[(0, 500)]));
 
     let buyer = Address::generate(&ctx.env);
-    ctx.client
-        .refund(&payment_ref(&ctx, 5), &buyer, &200_000, &0, &1_000_000, &None, &0);
+    ctx.client.refund(
+        &payment_ref(&ctx, 5),
+        &buyer,
+        &200_000,
+        &0,
+        &1_000_000,
+        &None,
+        &0,
+    );
     assert_eq!(ctx.client.get_tier_state().unwrap().settled_volume, 200_000);
 
     // The replacement ladder is evaluated against the preserved volume, so the

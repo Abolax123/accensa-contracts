@@ -4,13 +4,13 @@ extern crate std;
 
 use super::*;
 use crate::vdf;
+use crate::vrf::RandomnessRecord;
+use crate::VdfPolicyClient;
 use accensa_common::{PolicyContext, RefundPolicyClient, VdfPolicyParams};
 use crypto_bigint::{
     modular::runtime_mod::{DynResidue, DynResidueParams},
     Encoding, NonZero, U1024,
 };
-use crate::vrf::RandomnessRecord;
-use crate::VdfPolicyClient;
 use soroban_sdk::{
     testutils::{EnvTestConfig, Events},
     xdr::ToXdr,
@@ -278,7 +278,9 @@ fn expected_seed(env: &Env, vdf_id: &BytesN<32>, output: &[u8; 128], delay: u32)
     buf[..128].copy_from_slice(output);
     buf[128..160].copy_from_slice(&vdf_id.to_array());
     buf[160..164].copy_from_slice(&delay.to_be_bytes());
-    env.crypto().sha256(&Bytes::from_slice(env, &buf))
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf))
+        .to_bytes()
 }
 
 #[test]
@@ -377,7 +379,11 @@ fn test_generate_randomness_emits_event() {
 
     client.generate_randomness(&vid, &64, &pack(&env, &output, &witness));
     assert!(
-        !env.events().all().is_empty(),
+        !env.events()
+            .all()
+            .filter_by_contract(&client.address)
+            .events()
+            .is_empty(),
         "RandomnessGenerated must be published"
     );
 }

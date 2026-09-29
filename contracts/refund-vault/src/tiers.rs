@@ -41,7 +41,7 @@
 use accensa_common::{storage::extend_instance_ttl, Error};
 use soroban_sdk::{contractevent, contractimpl, contracttype, Address, Env, Vec};
 
-use crate::{DataKey, RefundVault, TTL_EXTEND, TTL_THRESHOLD};
+use crate::{DataKey, RefundVault, RefundVaultArgs, RefundVaultClient, TTL_EXTEND, TTL_THRESHOLD};
 
 /// Maximum number of rungs in a merchant's fee ladder. Bounds both the
 /// one-off ladder decode and the instance-storage footprint.
@@ -54,20 +54,16 @@ const BPS_DENOMINATOR: u32 = 10_000;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantTier {
-    /// Cumulative settled refund volume (in the settlement token's smallest
-    /// unit) at which this rung becomes active. The first rung is always `0`;
-    /// thresholds are strictly increasing.
+    /// Settled refund volume, in the token's smallest unit, at which this rung
+    /// activates. The first rung is `0`; thresholds strictly increase.
     pub min_settled: i128,
-    /// Fee, in basis points, applied to refunds while this rung is the
-    /// merchant's active tier.
+    /// Fee in basis points while this rung is active.
     pub fee_bps: u32,
 }
 
-/// The merchant's cached position on the fee ladder.
-///
-/// Kept in instance storage beside the ladder so the claim hot path can read
-/// the active fee and decide whether a threshold was crossed in one read,
-/// without decoding the whole ladder.
+/// The merchant's cached position on the fee ladder, in instance storage beside
+/// the ladder so the claim path reads one small value instead of decoding the
+/// whole ladder.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantTierState {
@@ -75,18 +71,17 @@ pub struct MerchantTierState {
     pub settled_volume: i128,
     /// Index of the active rung in [`DataKey::TierLadder`].
     pub current_tier: u32,
-    /// The active rung's fee — a mirror of `ladder[current_tier].fee_bps`.
+    /// The active rung's fee: a mirror of `ladder[current_tier].fee_bps`.
     pub fee_bps: u32,
-    /// Settled volume at which the next rung activates, or [`i128::MAX`] when
-    /// the merchant is already on the top rung.
+    /// Volume at which the next rung activates, or [`i128::MAX`] on the top
+    /// rung.
     pub next_threshold: i128,
 }
 
 /// Emitted when a claim's settled volume crosses a rung and the merchant is
-/// promoted.
-///
-/// Topics: `("merchant_tier_promoted", new_tier)`. The data carries the rung's
-/// fee so an indexer can reconstruct the effective rate without reading state.
+/// promoted. Topics: `("merchant_tier_promoted", new_tier)`; the data carries
+/// the rung's fee so an indexer can rebuild the effective rate without reading
+/// state.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantTierPromoted {
@@ -230,16 +225,14 @@ pub(crate) fn on_settled(env: &Env, amount: i128) {
 
 #[contractimpl]
 impl RefundVault {
-    /// Install (or replace) the merchant fee ladder. Merchant auth required.
+    /// Install (or replace) the merchant fee ladder; merchant auth required.
     ///
     /// `tiers` must be non-empty, at most [`MAX_TIERS`] long, start at a `0`
-    /// threshold, be strictly increasing, and carry fees at or below `10_000`
-    /// bps; otherwise [`Error::InvalidTierLadder`]. The merchant's current rung
-    /// is recomputed from the volume already settled, which is preserved across
-    /// a replacement (re-installing a ladder does not reset progress).
-    ///
-    /// While a ladder is installed it is the source of truth for the fee: the
-    /// flat [`RefundVault::set_fee_bps`] value applies only when the ladder is
+    /// threshold, strictly increase, and carry fees at or below `10_000` bps,
+    /// else [`Error::InvalidTierLadder`]. The current rung is recomputed from
+    /// the volume already settled, which a replacement preserves. While a
+    /// ladder is installed it is the fee source of truth: the flat
+    /// [`RefundVault::set_fee_bps`] value applies only once the ladder is
     /// cleared. Emits [`MerchantTierLadderUpdated`].
     pub fn set_tier_ladder(env: Env, tiers: Vec<MerchantTier>) -> Result<(), Error> {
         admin(&env)?.require_auth();
@@ -300,12 +293,12 @@ impl RefundVault {
     }
 
     /// Read-only: the merchant's tier bookkeeping (settled volume, active rung,
-    /// and next threshold), if a ladder is installed.
+    /// next threshold), if a ladder is installed.
     pub fn get_tier_state(env: Env) -> Option<MerchantTierState> {
         env.storage().instance().get(&DataKey::TierState)
     }
 
-    /// Read-only: the fee the next claim will charge. Equals the flat
+    /// Read-only: the fee the next claim will charge, equal to the flat
     /// [`RefundVault::get_fee_bps`] value when no ladder is installed.
     pub fn get_effective_fee_bps(env: Env) -> u32 {
         effective_fee_bps(&env)

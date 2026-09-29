@@ -38,7 +38,12 @@ pub struct RefundParam {
     pub vdf_proof: Option<BytesN<256>>,
 }
 
-#[contracttype]
+// `export = false`: the vault's storage keys are internal. No entry point takes
+// or returns one, so publishing them would only inflate the wasm — and the
+// contract-spec text is embedded in the wasm, which is capped at Stellar's
+// 128 KiB contract-code limit. The live layout is documented in
+// `docs/storage-audit.md`.
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     /// Per-instance domain separator (issue #136): `sha256(contract_address)`,

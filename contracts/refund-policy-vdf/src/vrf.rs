@@ -36,7 +36,7 @@ use accensa_common::{
 };
 use soroban_sdk::{contractevent, contractimpl, contracttype, Bytes, BytesN, Env};
 
-use crate::VdfPolicy;
+use crate::{VdfPolicy, VdfPolicyArgs, VdfPolicyClient};
 
 /// Storage keys for the randomness registry.
 ///
@@ -101,7 +101,9 @@ fn derive_seed(env: &Env, vdf_id: &BytesN<32>, output: &[u8; 128], delay: u32) -
     buf[..128].copy_from_slice(output);
     buf[128..160].copy_from_slice(&vdf_id.to_array());
     buf[160..164].copy_from_slice(&delay.to_be_bytes());
-    env.crypto().sha256(&Bytes::from_slice(env, &buf))
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf))
+        .to_bytes()
 }
 
 #[contractimpl]
@@ -132,11 +134,7 @@ impl VdfPolicy {
         proof: BytesN<256>,
     ) -> Result<BytesN<32>, Error> {
         let key = DataKey::Randomness(vdf_id.clone());
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<_, RandomnessRecord>(&key)
-        {
+        if let Some(existing) = env.storage().persistent().get::<_, RandomnessRecord>(&key) {
             return Ok(existing.seed);
         }
 
@@ -189,15 +187,11 @@ impl VdfPolicy {
 
     /// Read-only: whether a verified seed exists for `vdf_id`.
     pub fn has_randomness(env: Env, vdf_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Randomness(vdf_id))
+        env.storage().persistent().has(&DataKey::Randomness(vdf_id))
     }
 
     /// Read-only: the full record (seed + transcript metadata) for `vdf_id`.
     pub fn get_randomness_record(env: Env, vdf_id: BytesN<32>) -> Option<RandomnessRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Randomness(vdf_id))
+        env.storage().persistent().get(&DataKey::Randomness(vdf_id))
     }
 }
