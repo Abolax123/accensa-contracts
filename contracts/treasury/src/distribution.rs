@@ -13,15 +13,19 @@
 //!   `amount * PRECISION / total_staked`.
 //! - **Per-user checkpoint.** Each user stores the accumulator value at their
 //!   last interaction (stake / unstake / claim). Pending yield is
-//!   `staked * (accumulator - checkpoint) / PRECISION`.
+//!   `staked * (accumulator - checkpoint) / PRECISION`, plus whatever an
+//!   earlier stake size had already accrued ([`UserDistribution::pending`]).
 //! - **Real-time claiming.** Users can claim their accumulated yield at any
 //!   time; the claim transfers the pending yield immediately and updates the
 //!   checkpoint.
 //! - **Proportional to holdings.** The more tokens a user stakes, the larger
 //!   their share of every distribution.
-//! - **No double-counting.** A user's checkpoint is refreshed on every
-//!   interaction (stake, unstake, claim), so yield is never claimed twice for
-//!   the same accumulator range.
+//! - **Two tokens.** Users stake the treasury's own asset ([`DataKey::Token`]);
+//!   yield is paid out in the token handed to [`initialize`].
+//! - **No double-counting.** Yield accrued against a stake size is settled into
+//!   `pending` before that stake changes (and on every claim), so the same
+//!   accumulator range is never priced twice and a changed position never
+//!   forfeits what it already earned.
 //!
 //! # Invariant
 //!
@@ -62,6 +66,14 @@ pub struct UserDistribution {
     pub checkpoint: i128,
     /// Total yield claimed by the user, cumulatively.
     pub claimed: i128,
+    /// Yield accrued while staked at a *previous* stake size, settled here on
+    /// every stake / unstake so a changed position never forfeits it.
+    ///
+    /// The accumulator is global, so pending yield is `staked * accumulator_delta`.
+    /// Re-pricing that product against a new `staked` would either drop the
+    /// shortfall or double-count the excess, so the settled portion is carried
+    /// separately until it is claimed.
+    pub pending: i128,
 }
 
 // ── Events ─────────────────────────────────────────────────────────────────
@@ -132,6 +144,16 @@ fn state(env: &Env) -> Result<DistributionState, Error> {
         .ok_or(Error::DistributionNotInitialized)
 }
 
+/// The token stakers deposit into the distribution: the treasury's own asset
+/// (`DataKey::Token`), which is distinct from the yield token paid out on
+/// claim.
+fn holding_token(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Token)
+        .ok_or(Error::NotInitialized)
+}
+
 fn save_state(env: &Env, state: &DistributionState) {
     env.storage()
         .instance()
@@ -155,7 +177,10 @@ fn save_user_distribution(env: &Env, user: &Address, dist: &UserDistribution) {
 /// Pending yield for a user, in yield-token smallest units.
 ///
 /// `staked * (accumulator - checkpoint) / PRECISION`, saturating at zero.
-fn pending_yield_internal(state: &DistributionState, user: &UserDistribution) -> Result<i128, Error> {
+fn pending_yield_internal(
+    state: &DistributionState,
+    user: &UserDistribution,
+) -> Result<i128, Error> {
     if user.staked <= 0 || state.accumulator <= user.checkpoint {
         return Ok(0);
     }
@@ -163,12 +188,29 @@ fn pending_yield_internal(state: &DistributionState, user: &UserDistribution) ->
         .accumulator
         .checked_sub(user.checkpoint)
         .ok_or(Error::MathOverflow)?;
-    let pending = user
-        .staked
-        .checked_mul(diff)
-        .ok_or(Error::MathOverflow)?
-        / PRECISION;
+    let pending = user.staked.checked_mul(diff).ok_or(Error::MathOverflow)? / PRECISION;
     Ok(pending)
+}
+
+/// Move yield accrued against the *current* stake into the user's carried
+/// `pending` bucket and re-anchor their checkpoint, so the stake size can
+/// change without re-pricing yield that has already been earned.
+fn settle(user_dist: &mut UserDistribution, state: &DistributionState) -> Result<(), Error> {
+    user_dist.pending = user_dist
+        .pending
+        .checked_add(pending_yield_internal(state, user_dist)?)
+        .ok_or(Error::MathOverflow)?;
+    user_dist.checkpoint = state.accumulator;
+    Ok(())
+}
+
+/// Total claimable yield: the settled bucket plus whatever has accrued against
+/// the current stake since the user's last interaction.
+fn claimable(state: &DistributionState, user_dist: &UserDistribution) -> Result<i128, Error> {
+    user_dist
+        .pending
+        .checked_add(pending_yield_internal(state, user_dist)?)
+        .ok_or(Error::MathOverflow)
 }
 
 // ── Admin entry-point bodies ───────────────────────────────────────────────
@@ -196,9 +238,9 @@ pub fn initialize(env: &Env, token: Address) -> Result<(), Error> {
 
 /// Distribute `amount` of yield tokens to stakers. Admin only.
 ///
-/// The admin must have approved the contract to spend `amount` tokens, or the
-/// tokens must already be in the contract. The accumulator is updated so that
-/// each staked token's share of the distribution is immediately claimable.
+/// This records the accrual only; it moves no tokens. The float that claims are
+/// paid from must already be in the contract. The accumulator is updated so
+/// that each staked token's share of the distribution is immediately claimable.
 ///
 /// Returns the new accumulator value.
 pub fn distribute_yield(env: &Env, amount: i128) -> Result<i128, Error> {
@@ -209,14 +251,13 @@ pub fn distribute_yield(env: &Env, amount: i128) -> Result<i128, Error> {
     let token_addr = config_token(env)?;
     let mut current_state = state(env)?;
 
-    // Only update the accumulator when tokens are actually staked. If no one
-    // is staked, the yield sits in the contract until someone stakes, at which
-    // point the accumulator will move and the staker earns from that point.
+    // Only update the accumulator when tokens are actually staked. With no
+    // stakers there is nobody to attribute the yield to, so it stays in the
+    // contract and the next distribution is the first one the accumulator
+    // prices.
     if current_state.total_staked > 0 {
-        let increase = amount
-            .checked_mul(PRECISION)
-            .ok_or(Error::MathOverflow)?
-            / current_state.total_staked;
+        let increase =
+            amount.checked_mul(PRECISION).ok_or(Error::MathOverflow)? / current_state.total_staked;
         current_state.accumulator = current_state
             .accumulator
             .checked_add(increase)
@@ -243,27 +284,34 @@ pub fn distribute_yield(env: &Env, amount: i128) -> Result<i128, Error> {
 
 // ── User entry-point bodies ────────────────────────────────────────────────
 
-/// Stake `amount` of holding tokens to earn yield. Requires the caller's
-/// authorization.
+/// Stake `amount` of the treasury's holding token to earn yield. Requires the
+/// caller's authorization.
 ///
-/// The user's checkpoint is refreshed to the current accumulator, so they
-/// only earn yield from the moment they stake.
+/// Yield accrued against the previous stake is settled first, then the
+/// checkpoint is refreshed to the current accumulator, so the user earns from
+/// the moment of this stake without losing anything already earned.
 pub fn stake(env: &Env, user: &Address, amount: i128) -> Result<(), Error> {
     if amount <= 0 {
         return Err(Error::NothingToStake);
     }
 
-    let token_addr = config_token(env)?;
+    // `state` carries the initialization guard: nothing may be staked into a
+    // distribution that has not been configured yet.
     let current_state = state(env)?;
+    let token_addr = holding_token(env)?;
 
     let mut user_dist = user_distribution(env, user).unwrap_or(UserDistribution {
         staked: 0,
         checkpoint: current_state.accumulator,
         claimed: 0,
+        pending: 0,
     });
 
-    user_dist.checkpoint = current_state.accumulator;
-    user_dist.staked = user_dist.staked.checked_add(amount).ok_or(Error::MathOverflow)?;
+    settle(&mut user_dist, &current_state)?;
+    user_dist.staked = user_dist
+        .staked
+        .checked_add(amount)
+        .ok_or(Error::MathOverflow)?;
 
     let client = token::Client::new(env, &token_addr);
     client.transfer(user, env.current_contract_address(), &amount);
@@ -296,15 +344,15 @@ pub fn unstake(env: &Env, user: &Address, amount: i128) -> Result<(), Error> {
         return Err(Error::NothingToUnstake);
     }
 
-    let token_addr = config_token(env)?;
     let current_state = state(env)?;
+    let token_addr = holding_token(env)?;
 
     let mut user_dist = user_distribution(env, user).ok_or(Error::NothingToUnstake)?;
     if amount > user_dist.staked {
         return Err(Error::UnstakeExceedsStaked);
     }
 
-    user_dist.checkpoint = current_state.accumulator;
+    settle(&mut user_dist, &current_state)?;
     user_dist.staked = user_dist
         .staked
         .checked_sub(amount)
@@ -343,41 +391,49 @@ pub fn claim_yield(env: &Env, user: &Address) -> Result<i128, Error> {
         staked: 0,
         checkpoint: current_state.accumulator,
         claimed: 0,
+        pending: 0,
     });
 
-    let pending = pending_yield_internal(&current_state, &user_dist)?;
-    if pending <= 0 {
+    settle(&mut user_dist, &current_state)?;
+    let amount = user_dist.pending;
+    if amount <= 0 {
         return Err(Error::NoYieldToClaim);
     }
+    user_dist.pending = 0;
 
-    user_dist.checkpoint = current_state.accumulator;
-    user_dist.claimed = user_dist.claimed.checked_add(pending).ok_or(Error::MathOverflow)?;
+    user_dist.claimed = user_dist
+        .claimed
+        .checked_add(amount)
+        .ok_or(Error::MathOverflow)?;
     save_user_distribution(env, user, &user_dist);
 
     let client = token::Client::new(env, &token_addr);
-    client.transfer(&env.current_contract_address(), user, &pending);
+    client.transfer(&env.current_contract_address(), user, &amount);
 
     YieldClaimedEvent {
         user: user.clone(),
-        amount: pending,
+        amount,
         total_claimed: user_dist.claimed,
     }
     .publish(env);
 
-    Ok(pending)
+    Ok(amount)
 }
 
 // ── Read-only ──────────────────────────────────────────────────────────────
 
 /// Read-only: pending yield for `user`, in yield-token smallest units.
+///
+/// The settled bucket plus whatever has accrued against the current stake.
 pub fn pending_yield(env: &Env, user: &Address) -> Result<i128, Error> {
     let current_state = state(env)?;
     let user_dist = user_distribution(env, user).unwrap_or(UserDistribution {
         staked: 0,
         checkpoint: current_state.accumulator,
         claimed: 0,
+        pending: 0,
     });
-    pending_yield_internal(&current_state, &user_dist)
+    claimable(&current_state, &user_dist)
 }
 
 /// Read-only: the current global accumulator value.
