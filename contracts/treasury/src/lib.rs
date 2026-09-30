@@ -49,6 +49,9 @@ use soroban_sdk::{
 pub mod buyback;
 #[cfg(test)]
 mod buyback_test;
+pub mod distribution;
+#[cfg(test)]
+mod distribution_test;
 pub mod liquidation;
 #[cfg(test)]
 mod liquidation_test;
@@ -179,6 +182,25 @@ pub enum Error {
     InvalidBuybackConfig = 28,
     /// The treasury does not hold enough of the fee token to run the buyback.
     InsufficientBuybackFloat = 29,
+    /// A yield-distribution call ran before `distribution::initialize`, so
+    /// either the config or the accumulator state is missing (issue #523).
+    DistributionNotInitialized = 30,
+    /// `distribution::initialize` ran on an already-initialized distribution
+    /// (issue #523).
+    DistributionAlreadyInitialized = 31,
+    /// A distribution was requested for a non-positive amount of yield
+    /// (issue #523).
+    NothingToDistribute = 32,
+    /// A stake call requested a non-positive amount (issue #523).
+    NothingToStake = 33,
+    /// An unstake call requested a non-positive amount, or the caller has no
+    /// stake record to draw down (issue #523).
+    NothingToUnstake = 34,
+    /// The requested unstake exceeds what the caller has staked (issue #523).
+    UnstakeExceedsStaked = 35,
+    /// The caller has no settled yield and nothing has accrued against their
+    /// current stake, so a claim would pay nothing (issue #523).
+    NoYieldToClaim = 36,
 }
 
 /// Emitted when the admin registers a beneficiary's allocation.
@@ -725,7 +747,7 @@ impl Treasury {
     ///
     /// # Errors
     ///
-    /// [`Error::NothingToClaim`] when there is no pending yield.
+    /// [`Error::NoYieldToClaim`] when there is no pending yield.
     pub fn claim_yield(env: Env, user: Address) -> Result<i128, Error> {
         require_initialized(&env)?;
         user.require_auth();
@@ -753,7 +775,10 @@ impl Treasury {
     }
 
     /// Read-only: a user's distribution state, if they have one.
-    pub fn get_user_distribution(env: Env, user: Address) -> Option<distribution::UserDistribution> {
+    pub fn get_user_distribution(
+        env: Env,
+        user: Address,
+    ) -> Option<distribution::UserDistribution> {
         distribution::get_user_distribution(&env, &user)
     }
 }

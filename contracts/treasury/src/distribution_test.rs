@@ -93,8 +93,12 @@ fn distribution_requires_initialization() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let holding = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let yield_tok = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let holding = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let yield_tok = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let treasury = env.register(Treasury, (admin.clone(), holding.clone()));
     let client = TreasuryClient::new(&env, &treasury);
 
@@ -114,7 +118,9 @@ fn distribution_requires_initialization() {
 
     // After init: they work.
     client.initialize_distribution(&yield_tok);
-    assert!(client.try_stake(&client.address, &1_000).is_ok());
+    let alice = Address::generate(&env);
+    StellarAssetClient::new(&env, &holding).mint(&alice, &1_000);
+    assert!(client.try_stake(&alice, &1_000).is_ok());
 }
 
 #[test]
@@ -499,8 +505,12 @@ fn only_admin_can_initialize_distribution() {
     env.ledger().with_mut(|li| li.timestamp = START);
 
     let admin = Address::generate(&env);
-    let holding = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let yield_tok = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let holding = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let yield_tok = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let treasury = env.register(Treasury, (admin.clone(), holding.clone()));
     let client = TreasuryClient::new(&env, &treasury);
 
