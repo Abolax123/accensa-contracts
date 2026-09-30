@@ -462,6 +462,12 @@ breaking changes bump the **minor** version, and they are called out as such.
   `test_events_emitted`, removing the repeated field-set boilerplate.
 
 ### Fixed
+- **`refund-vault`: test modules are no longer compiled into the release
+  build.** `token_agnostic_tests` and `yield_tests` were the only two test
+  modules declared without `#[cfg(test)]`, so roughly 1.3k lines of test code
+  entered the non-test build path. They are dead-code eliminated at present,
+  which is why the deployed WASM is unchanged, but the mismatch meant a test
+  helper with any side effect would have shipped silently.
 - **Build fixes for code merged without compiling.** `governance` declares
   its `voting` and `math` modules and no longer moves `member` before reuse;
   stray `#![no_std]` attributes in submodules (`governance` `ragequit.rs` /
