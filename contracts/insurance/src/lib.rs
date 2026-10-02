@@ -379,8 +379,10 @@ impl InsurancePool {
     /// Withdraw `amount` of supplied capital. Requires the user's
     /// authorization.
     ///
-    /// Rejects amounts above the user's settled balance (`InvalidAmount`) or
-    /// above the pool's liquid float (`InsufficientLiquidity`).
+    /// Rejects amounts above the user's settled balance (`InvalidAmount`),
+    /// withdrawals that would leave outstanding debt above the remaining
+    /// collateral (`ExceedsCollateral`), or amounts above the pool's liquid
+    /// float (`InsufficientLiquidity`).
     pub fn withdraw(env: Env, user: Address, amount: i128) -> Result<(), Error> {
         user.require_auth();
         if amount <= 0 {
@@ -391,6 +393,13 @@ impl InsurancePool {
         let mut info = settle_user(&env, &user)?;
         if amount > info.supplied {
             return Err(Error::InvalidAmount);
+        }
+        let remaining = info
+            .supplied
+            .checked_sub(amount)
+            .ok_or(Error::InvalidAmount)?;
+        if info.borrowed > remaining {
+            return Err(Error::ExceedsCollateral);
         }
         let liquid = total_supplied(&env).saturating_sub(total_borrowed(&env));
         if amount > liquid {

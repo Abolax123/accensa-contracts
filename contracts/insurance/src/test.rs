@@ -214,6 +214,21 @@ fn test_borrow_rejects_exceeds_collateral() {
 }
 
 #[test]
+fn test_withdraw_rejects_borrower_withdrawing_collateral() {
+    let s = setup();
+    s.client.deposit(&s.alice, &1_000);
+    s.client.deposit(&s.bob, &500);
+    s.client.borrow(&s.bob, &500);
+
+    // Bob's debt equals his supplied collateral; withdrawing any of it
+    // would leave the debt unbacked.
+    assert_eq!(
+        s.client.try_withdraw(&s.bob, &500),
+        Err(Ok(Error::ExceedsCollateral))
+    );
+}
+
+#[test]
 fn test_repay_reduces_borrowed_amount() {
     let s = setup();
     s.client.deposit(&s.alice, &1_000);

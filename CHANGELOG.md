@@ -45,7 +45,9 @@ breaking changes bump the **minor** version, and they are called out as such.
   pool float), and every call settles the user's accrued interest into their
   checkpointed balances before mutating positions. Withdrawals are rejected
   when they would leave `borrowed > supplied - amount`, preventing
-  collateral withdrawal that leaves debt unbacked.
+  collateral withdrawal that leaves debt unbacked. Includes 16 tests
+  covering accrual, liquidity, collateral, settlement, and the withdrawal
+  safeguard.
 - **`receipt-shard` (issue #437): shard storage consolidation.** Router-authorized source shards can migrate exact `BatchRecord` values into a destination shard, verify the returned record before deletion, emit `ShardsConsolidated`, and mark drained sources inactive to stop further writes.
 - **`state-channel` (issue #431): anti-sniping late counter-proof extension.** A
   valid counter-proof submitted within the final 50 ledgers of the dispute window
