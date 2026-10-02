@@ -5,6 +5,7 @@ members = [
     "contracts/governance",
     "contracts/oracle",
     "contracts/multisig-account",
+    "contracts/privacy",
     "contracts/receipt-anchor",
     "contracts/receipt-shard",
     "contracts/reputation",
